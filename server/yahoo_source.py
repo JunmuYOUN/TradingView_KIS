@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable
 from operator import itemgetter
 
 from .bars import MINUTE_TFS, PERIOD_TFS, aggregate, bucket_start, dedupe_sort, kst_epoch
-from .codes import is_yahoo
+from .codes import valid_yahoo_feed_ticker
 from .yahoo_delay import YahooQuoteStatus
 
 DAY = 86400
@@ -89,9 +89,10 @@ async def _load_chart(ticker, interval, start, end):
 class YahooSource:
     name = "yahoo"
 
-    def __init__(self, loader: _Loader | None = None):
+    def __init__(self, loader: _Loader | None = None, *, allow_stocks: bool = False):
         self._loader = loader or _load_chart
-        self._status = YahooQuoteStatus()
+        self._allow_stocks = allow_stocks
+        self._status = YahooQuoteStatus(allow_stocks=allow_stocks)
         self._cache: OrderedDict[tuple, tuple[float, list[dict]]] = OrderedDict()
         self._pending: dict[tuple, asyncio.Task] = {}
         self._network = asyncio.Lock()  # yfinance shares its cookie/session across instances.
@@ -99,7 +100,7 @@ class YahooSource:
         self._closed = False
 
     async def _read(self, ticker, interval, start, end) -> list[dict]:
-        if not is_yahoo("YF:" + ticker):
+        if not valid_yahoo_feed_ticker(ticker, allow_stocks=self._allow_stocks):
             raise YahooError("지원하지 않는 Yahoo Finance 종목입니다.", 404)
         async with self._network:
             if self._closed:

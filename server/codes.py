@@ -16,6 +16,7 @@ OVERSEAS_RE = re.compile(r"^(NAS|NYS|AMS):([A-Z0-9][A-Z0-9.\-]{0,15})$")
 EXCHANGES = {"NAS": "NASDAQ", "NYS": "NYSE", "AMS": "AMEX"}
 INDEX_RE = re.compile(r"INDEX:(?:[0-9]{4}|(?=.{1,10}\Z)\.?[A-Z][A-Z0-9]*(?:[.\-][A-Z0-9]+)*)")
 YAHOO_RE = re.compile(r"(?:[A-Z0-9]{1,12}=F|(?:[A-Z]{3}|[A-Z]{6})=X|\^[A-Z0-9]+(?:[.\-][A-Z0-9]+)*)")
+YAHOO_STOCK_RE = re.compile(r"(?:[A-Z0-9]{6}\.K[SQ]|[A-Z0-9][A-Z0-9-]{0,15})")
 
 
 def normalize(code) -> str | None:
@@ -40,6 +41,10 @@ def yahoo_candidate(text: str) -> str | None:
 
 def is_yahoo(code: str) -> bool:
     return isinstance(code, str) and code.startswith("YF:") and yahoo_candidate(code) == code
+
+
+def valid_yahoo_feed_ticker(ticker: str, *, allow_stocks: bool) -> bool:
+    return is_yahoo("YF:" + ticker) or (allow_stocks and YAHOO_STOCK_RE.fullmatch(ticker) is not None)
 
 
 def yahoo_ticker(code: str) -> str:

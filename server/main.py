@@ -40,9 +40,11 @@ DEFAULT_DAYS = {"1": 1, "3": 2, "5": 3, "15": 5, "30": 8, "60": 15}
 DEFAULT_COUNT = {"D": 400, "W": 300, "M": 200}
 
 
-def make_source(settings: Settings):
+def make_source(settings: Settings, yahoo: YahooSource):
     if settings.source == "kis":
         return KisSource(settings)
+    if settings.source == "yahoo":
+        return yahoo
     return MockSource()
 
 
@@ -51,13 +53,14 @@ async def lifespan(app: FastAPI):
     remove_legacy_plaintext()  # 이전 버전이 평문으로 남긴 토큰 캐시를 지웁니다
     settings = getattr(app.state, "initial_settings", None) or load_settings()
     app.state.settings = settings
-    app.state.source = make_source(settings)
-    app.state.yahoo = YahooSource()
+    app.state.yahoo = YahooSource(allow_stocks=getattr(app.state, "desktop", False))
+    app.state.source = make_source(settings, app.state.yahoo)
     app.state.event_loop = asyncio.get_running_loop()
     app.state.connection_lock = asyncio.Lock()
     app.state.ws_clients = 0
     app.state.history = SearchHistory(DATA_DIR / "search_history.json")
-    download_symbols = settings.symbol_download and (not getattr(app.state, "desktop", False) or settings.source == "kis")
+    download_symbols = settings.symbol_download and (not getattr(app.state, "desktop", False)
+                                                      or settings.source in {"kis", "yahoo"})
     app.state.symbols = SymbolBook(DATA_DIR / "symbols.json", download=download_symbols)
     for item in app.state.history.load():  # 종목 목록을 못 받아도 예전에 찾은 종목은 이름으로 찾을 수 있게
         app.state.symbols.remember(item["code"], item["name"])
@@ -70,7 +73,8 @@ async def lifespan(app: FastAPI):
         loop.call_later(0.5, loop.run_in_executor, None, open_chart_browser, browser_url)
     yield
     await app.state.symbols.close()
-    await app.state.source.close()
+    if app.state.source is not app.state.yahoo:
+        await app.state.source.close()
     await app.state.yahoo.close()
 
 
@@ -108,6 +112,17 @@ def chart_source(code: str):
     return app.state.source, code
 
 
+async def chart_instrument(code: str):
+    source, ticker = chart_source(code)
+    if source.name == "yahoo" and not codes.is_yahoo(code):
+        ticker = await app.state.symbols.yahoo_chart_ticker(code)
+        if ticker is None:
+            if codes.is_index(code):
+                raise HTTPException(404, "이 지수에 연결된 Yahoo Finance 티커가 없습니다.")
+            raise HTTPException(404, "종목의 상장 시장을 확인할 수 없습니다. 종목 검색 목록에서 다시 선택하세요.")
+    return source, ticker
+
+
 async def current_quote_status(source, code: str, ticker: str, tf: str):
     if source.name == "yahoo":
         try:
@@ -142,7 +157,7 @@ async def api_config(request: Request):
     settings = request.app.state.settings
     return {"source": settings.source, "env": settings.env, "market": settings.market,
             "desktop": getattr(request.app.state, "desktop", False),
-            "quote_transport": "https" if settings.source == "kis" else "mock", "ws_tr_id": None}
+            "quote_transport": "https" if settings.source in {"kis", "yahoo"} else "mock", "ws_tr_id": None}
 
 
 async def json_body(request: Request) -> dict:
@@ -267,11 +282,13 @@ async def api_candles(request: Request, code: str, tf: str = "D", days: int | No
 
 async def candle_page(code, tf, days, count, before, from_date):
     code = await check_chart_code(code)
-    src, ticker = chart_source(code)
+    src, ticker = await chart_instrument(code)
     if from_date is not None:
         if src.name != "yahoo" or tf not in PERIOD_TFS or before is None or from_date >= before:
             raise HTTPException(400, "날짜 이동에는 Yahoo 일·주·월봉의 시작일과 그 이후의 종료일이 필요합니다.")
         bars, earliest, has_more = await src.period_prefix(ticker, tf, from_date, before)
+        if src is not chart_source(code)[0]:
+            raise HTTPException(409, "연결이 변경되었습니다")
         return {"code": code, "tf": tf, "bars": bars, "has_more": has_more,
                 "source": src.name, "earliest_available": earliest}
     if tf in MINUTE_TFS:
@@ -342,7 +359,7 @@ async def latest_quotes(request: Request, code: str, tf: str = "D",
     code = await check_chart_code(code)
     if tf not in MINUTE_TFS and tf not in PERIOD_TFS:
         raise HTTPException(400, "지원하지 않는 타임프레임입니다")
-    source, ticker = chart_source(code)
+    source, ticker = await chart_instrument(code)
     if source.name == "mock":
         raise HTTPException(409, "한투 API 로그인이 필요합니다")
     bars, recovery, next_before = await while_connected(request, quote_update(source, ticker, tf, since, before))

@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 import httpx
 
-from .codes import is_yahoo
+from .codes import valid_yahoo_feed_ticker
 from .yahoo_symbols import YAHOO_SYMBOLS
 
 
@@ -107,7 +107,8 @@ def status_from_metadata(ticker, instrument_quote, chart_meta, *, now, use_quote
 
 
 class YahooQuoteStatus:
-    def __init__(self):
+    def __init__(self, *, allow_stocks: bool = False):
+        self._allow_stocks = allow_stocks
         self._client = None
         self._quotes = OrderedDict()
         self._statuses = OrderedDict()
@@ -177,7 +178,8 @@ class YahooQuoteStatus:
         if snapshot and time.monotonic() - snapshot[0] < 60:
             return snapshot[1]
         if ticker not in self._pending:
-            if self._closed or not is_yahoo("YF:" + ticker) or len(self._pending) >= 3:
+            if (self._closed or len(self._pending) >= 3
+                    or not valid_yahoo_feed_ticker(ticker, allow_stocks=self._allow_stocks)):
                 return status_from_metadata(ticker, {}, {}, now=int(time.time()))
             self._pending[ticker] = asyncio.create_task(self._refresh(ticker))
         return await asyncio.shield(self._pending[ticker])

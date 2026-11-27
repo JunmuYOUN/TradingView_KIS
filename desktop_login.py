@@ -29,8 +29,8 @@ def load_desktop_settings() -> Settings:
 def load_startup_settings() -> Settings:
     settings = load_desktop_settings()
     if settings.source == "kis":
-        return replace(settings, source="mock")
-    return replace(settings, source="mock", app_key="", app_secret="")
+        return replace(settings, source="yahoo")
+    return replace(settings, source="yahoo", app_key="", app_secret="")
 
 
 async def restore_desktop_session(state) -> str | None:
@@ -46,15 +46,20 @@ async def logout_kis(state) -> str:
     """End this app's KIS session, including credentials for automatic login."""
     async with state.connection_lock:
         previous = state.source
-        settings = replace(state.settings, source="mock", app_key="", app_secret="")
-        state.source, state.settings = MockSource(), settings
+        guest = state.yahoo if getattr(state, "desktop", False) else MockSource()
+        settings = replace(state.settings, source=guest.name, app_key="", app_secret="")
+        state.source, state.settings = guest, settings
         state.initial_settings = settings
         symbols = getattr(state, "symbols", None)
         if symbols is not None:
-            symbols.download = False
-            await symbols.close()
+            symbols.download = guest.name == "yahoo" and settings.symbol_download
+            if symbols.download:
+                symbols.refresh_if_stale()
+            else:
+                await symbols.close()
         try:
-            await previous.close()
+            if previous is not guest:
+                await previous.close()
         except Exception as exc:
             log.warning("시세 연결 종료 실패 (%s)", type(exc).__name__)
         try:
@@ -108,7 +113,8 @@ async def connect_kis(state, app_key: str, app_secret: str, *, restore_saved: bo
             finally:
                 inactive = previous if state.source is source else source
                 try:
-                    await inactive.close()
+                    if inactive is not getattr(state, "yahoo", None):
+                        await inactive.close()
                 except Exception as exc:
                     log.warning("이전 데이터 연결 정리 실패 (%s)", type(exc).__name__)
     return "한투 인증에 실패했습니다. App Key와 App Secret을 확인하세요."
@@ -163,7 +169,7 @@ def _show_dialog(owner, state, *, startup: bool = False, message: str = "") -> b
     if current.app_key and current.app_secret:
         label("저장된 키로 다시 로그인하려면 두 입력칸을 비워 두세요.", 24, 46, 430).ForeColor = Color.DimGray
     elif startup:
-        label("‘데모로 시작’을 누르면 예시 시세로 차트를 사용할 수 있습니다.", 24, 46, 430).ForeColor = Color.DimGray
+        label("KIS API 없이 사용하면 Yahoo Finance 시세로 차트를 엽니다.", 24, 46, 430).ForeColor = Color.DimGray
 
     key = field("App Key", 75, secret=True)
     secret = field("App Secret", 131, secret=True)
@@ -172,10 +178,10 @@ def _show_dialog(owner, state, *, startup: bool = False, message: str = "") -> b
     submit = ui.Button()
     submit.Text = "로그인"
     cancel = ui.Button()
-    cancel.Text = "데모로 시작" if startup else "취소"
+    cancel.Text = "KIS API 없이 사용" if startup else "취소"
     cancel.DialogResult = ui.DialogResult.Cancel
-    place(submit, 234, 239, 96, 30)
-    place(cancel, 338, 239, 116, 30)
+    place(submit, 200, 239, 96, 30)
+    place(cancel, 304, 239, 150, 30)
     form.AcceptButton, form.CancelButton = submit, cancel
 
     timer = ui.Timer()

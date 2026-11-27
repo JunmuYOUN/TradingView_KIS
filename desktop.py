@@ -106,7 +106,7 @@ def main() -> None:
 
         with running_server() as (app, launch_url):
             account_action = Lock()
-            account_action.acquire()  # 계정 메뉴는 시작 시 로그인 또는 데모 선택이 끝난 뒤 엽니다.
+            account_action.acquire()  # 시작 화면에서 시세 연결을 선택한 뒤 계정 메뉴를 엽니다.
 
             def load_chart(url: str, *, retry_logout: bool = False) -> None:
                 settings = app.state.settings
@@ -122,13 +122,13 @@ def main() -> None:
                         message = future.result()
                     except Exception as exc:
                         log.error("저장된 한투 연결 확인 실패 (%s)", type(exc).__name__)
-                        message = "저장된 한투 연결을 확인하지 못했습니다. 다시 로그인하거나 데모로 시작하세요."
+                        message = "저장된 한투 연결을 확인하지 못했습니다. 다시 로그인하거나 KIS API 없이 사용하세요."
                     if message is not None and not window.events.closed.is_set():
                         show_login(window.native, app.state, startup=True, message=message)
                 except Exception as exc:
                     if not window.events.closed.is_set():
                         log.error("시작 로그인 화면을 열지 못했습니다 (%s)", type(exc).__name__)
-                        show_error("로그인 창을 열지 못해 데모 차트를 엽니다. 계정 메뉴에서 다시 로그인할 수 있습니다.")
+                        show_error("로그인 창을 열지 못해 Yahoo Finance 차트를 엽니다. 계정 메뉴에서 다시 로그인할 수 있습니다.")
                 finally:
                     try:
                         if not window.events.closed.is_set():

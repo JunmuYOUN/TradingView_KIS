@@ -36,7 +36,8 @@ const isIndex = code => INDEX_RE.test(code);
 const isYahoo = code => /^YF:(?=.{1,24}$)\^?[A-Z0-9][A-Z0-9.-]*(?:=[FX])?$/.test(code);
 const isCode = code => DOMESTIC_RE.test(code) || OVERSEAS_RE.test(code) || isIndex(code) || isYahoo(code);
 const isChartIndex = code => isIndex(code) || (isYahoo(code) && !code.includes('='));
-const usesHttpQuotes = code => isYahoo(code) || state.quoteTransport === 'https';
+const usesYahooQuotes = code => isYahoo(code) || state.config?.source === 'yahoo';
+const usesHttpQuotes = code => usesYahooQuotes(code) || state.quoteTransport === 'https';
 const yahooPrecision = new Map();
 const tickerOf = code => code.slice(code.indexOf(':') + 1);
 const isUsIndex = code => isIndex(code) && !/^INDEX:\d{4}$/.test(code);
@@ -113,8 +114,8 @@ const indicatorLibrary = setupIndicatorLibrary({
   onPersonalScriptsChange: entries => studies.setPersonalScripts(entries),
 });
 alerts = setupPriceAlerts(() => ({
-  key: isYahoo(state.code) ? 'yahoo/' + state.code : [state.config?.source, state.config?.env, DOMESTIC_RE.test(state.code) ? state.config?.market : '', state.code].join('/'),
-  label: symbolLabel(state.code), price: state.bars.at(-1)?.close, formatPrice: isYahoo(state.code) ? fmtPrice : null,
+  key: usesYahooQuotes(state.code) ? 'yahoo/' + state.code : [state.config?.source, state.config?.env, DOMESTIC_RE.test(state.code) ? state.config?.market : '', state.code].join('/'),
+  label: symbolLabel(state.code), price: state.bars.at(-1)?.close, formatPrice: usesYahooQuotes(state.code) ? fmtPrice : null,
   allowNegative: isYahoo(state.code) && state.code.endsWith('=F'),
   code: state.code, tf: state.tf, time: state.bars.at(-1)?.time,
   chartReady: state.loadedSeq === state.loadSeq && !replay.bars,
@@ -158,7 +159,7 @@ async function chartData(path, code, tf, { before, since, fromDate, signal } = {
   if (since != null) params.set('since', since);
   if (fromDate != null) params.set('from_date', fromDate);
   const page = await api(`${path}?${params}`, { signal });
-  if (isYahoo(code) && page.source !== 'yahoo') throw new Error('Yahoo Finance 시세 출처를 확인할 수 없습니다.');
+  if (usesYahooQuotes(code) && page.source !== 'yahoo') throw new Error('Yahoo Finance 시세 출처를 확인할 수 없습니다.');
   return page;
 }
 
@@ -176,7 +177,7 @@ function applyPriceFormat(code, bars) {
 
 function renderStudies(bars, tailOnly = false) {
   studies.setData(bars, { code: state.code, tf: state.tf, isIndex: isChartIndex(state.code),
-    rawVolume: isYahoo(state.code), pricePrecision: isYahoo(state.code) ? priceDecimals : undefined }, tailOnly);
+    rawVolume: isYahoo(state.code), pricePrecision: usesYahooQuotes(state.code) ? priceDecimals : undefined }, tailOnly);
 }
 
 function renderLatestBar() {
@@ -370,7 +371,7 @@ function followQuotes() {
   if (usesHttpQuotes(code)) {
     const controller = new AbortController();
     quoteRequest = controller;
-    const yahoo = isYahoo(code);
+    const yahoo = usesYahooQuotes(code);
     const tf = state.tf;
     const seq = state.loadSeq;
     const pollingInfo = yahoo ? 'Yahoo Finance 시세를 1분 간격으로 조회합니다. 거래소에 따라 지연될 수 있습니다.'
@@ -461,7 +462,7 @@ function isoDay(time) { return new Date(time * 1000).toISOString().slice(0, 10);
 
 function updateDateJump() {
   const button = $('#date-jump');
-  button.hidden = !isYahoo(state.code) || isMinuteTf(state.tf);
+  button.hidden = !usesYahooQuotes(state.code) || isMinuteTf(state.tf);
   button.disabled = Boolean(replay.bars) || state.loadedSeq !== state.loadSeq || !state.bars.length;
 }
 
@@ -551,14 +552,14 @@ function showBarCount() {
   const nxtPeriod = state.config?.source === 'kis' && state.config.market === 'NX'
     && DOMESTIC_RE.test(state.code) && !isMinuteTf(state.tf);
   if (!state.bars.length && nxtPeriod) return setStatus('empty', '이 종목의 NXT 시세가 없습니다. 설정에서 KRX를 선택할 수 있습니다.');
-  if (!state.bars.length && isYahoo(state.code)) return setStatus('empty', 'Yahoo Finance에서 이 기간의 시세를 제공하지 않습니다.');
+  if (!state.bars.length && usesYahooQuotes(state.code)) return setStatus('empty', 'Yahoo Finance에서 이 기간의 시세를 제공하지 않습니다.');
   if (!state.bars.length && isIndex(state.code)) return setStatus('empty', '이 기간에 조회된 지수 봉이 없습니다.');
   if (state.bars.length && !replay.bars && nearHistoryEdge(chart.timeScale().getVisibleLogicalRange())) {
     if (older.loading) return setStatus('loading', '이전 차트 불러오는 중…');
     if (older.error) return setStatus('history-error', `이전 차트 조회 실패 · ${older.error}`);
     if (!older.hasMore) {
       const first = new Date(state.bars[0].time * 1000).toISOString().slice(0, 10);
-      if (isYahoo(state.code) && Number.isFinite(older.firstAvailable)) {
+      if (usesYahooQuotes(state.code) && Number.isFinite(older.firstAvailable)) {
         return setStatus('ok', `${count} · Yahoo Finance 첫 시세 ${isoDay(older.firstAvailable)}`);
       }
       if (nxtPeriod) return setStatus('ok', `NXT 첫 봉 ${first} · 더 오래된 한국거래소 시세는 설정에서 KRX를 선택하세요.`);
@@ -586,7 +587,7 @@ function paintLive() {
   }
   el.dataset.kind = kind;
   el.title = kind === 'live' ? '앱에서 생성한 가격과 거래량을 갱신합니다.' : text || '';
-  const secureLabel = isYahoo(state.code) ? '1분 갱신' : 'HTTPS · 5초';
+  const secureLabel = usesYahooQuotes(state.code) ? '1분 갱신' : 'HTTPS · 5초';
   $('#live-text').textContent = kind === 'secure' ? secureLabel : kind === 'live' ? '자동 갱신' : kind === 'error' ? '오류' : kind === 'off' ? '끊김' : '연결 중';
 }
 
@@ -595,8 +596,8 @@ function paintQuoteStatus() {
   const info = state.quoteStatus;
   let label = '', title = '', kind = 'delayed';
   if (info && state.bars.length && !replay.bars
-    && (isYahoo(state.code) || state.config?.source === 'kis')) {
-    const venue = isYahoo(state.code) ? 'Yahoo Finance' : '한국투자증권';
+    && usesHttpQuotes(state.code)) {
+    const venue = usesYahooQuotes(state.code) ? 'Yahoo Finance' : '한국투자증권';
     const closed = info.market_open === false;
     const session = info.market_state === 'pre' ? '정규장 전' : info.market_state === 'post' ? '정규장 후' : '장 마감';
     if (info.end_of_day === true) {
@@ -764,6 +765,14 @@ function markActive(scroll) {
   });
 }
 
+function symbolKind(item) {
+  const kind = isIndex(item.code) ? indexLabel(item.code)
+    : item.kind && item.kind !== '주식' ? item.kind : item.market;
+  if (usesYahooQuotes(item.code)) return [kind, 'Yahoo'].filter(Boolean).join(' · ');
+  if (item.code === 'INDEX:VIX') return kind + (state.config?.source === 'kis' ? ' · 한투' : ' · 데모');
+  return kind || '';
+}
+
 function renderSuggest() {
   const isHistory = search.mode === 'history';
   suggest.replaceChildren();
@@ -786,10 +795,7 @@ function renderSuggest() {
     row.setAttribute('role', 'option');
     row.append(nameCell(item.name || '이름 모름', isHistory ? '' : search.query),
       el('span', 'sg-code', item.symbol || tickerOf(item.code)),
-      el('span', 'sg-kind', isYahoo(item.code) ? [item.kind, 'Yahoo'].filter(Boolean).join(' · ')
-        : item.code === 'INDEX:VIX' ? indexLabel(item.code) + (state.config?.source === 'kis' ? ' · 한투' : ' · 데모')
-        : isIndex(item.code) ? indexLabel(item.code)
-        : item.kind && item.kind !== '주식' ? item.kind : item.market || ''));
+      el('span', 'sg-kind', symbolKind(item)));
     if (isHistory) {
       const del = el('button', 'sg-del', '×');
       del.type = 'button';
@@ -1026,7 +1032,7 @@ async function switchTf(tf) {
 function updateSourceBadge() {
   const cfg = state.config;
   const badge = $('#source');
-  if (isYahoo(state.code)) {
+  if (usesYahooQuotes(state.code)) {
     badge.textContent = 'Yahoo Finance';
     badge.title = 'Yahoo Finance에서 받은 시장 시세입니다. 시세 지연 시간은 거래소마다 다릅니다.';
     badge.dataset.kind = 'yahoo';
@@ -1116,7 +1122,8 @@ async function init() {
     state.quoteTransport = state.config.quote_transport;
     $('#view-tabs').hidden = !!state.config.desktop;
     $('#domestic-market').value = state.config.market;
-    $('#domestic-market').disabled = false;
+    $('#domestic-market').disabled = state.config.source === 'yahoo';
+    if (state.config.source === 'yahoo') $('#market-status').textContent = '거래소 선택은 한투 시세에 적용됩니다.';
   } catch (e) {
     $('#market-status').textContent = '거래소 설정을 불러오지 못했습니다.';
   }

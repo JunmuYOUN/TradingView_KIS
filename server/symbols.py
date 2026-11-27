@@ -85,6 +85,13 @@ BENCHMARKS = {
 }
 POPULAR = frozenset(row[0] for row in BUILTIN) | BENCHMARKS.keys()
 
+# Yahoo index identifiers are independent of KIS industry and benchmark codes.
+YAHOO_BENCHMARK_TICKERS = {
+    "INDEX:0001": "^KS11", "INDEX:1001": "^KQ11", "INDEX:2001": "^KS200",
+    "INDEX:.DJI": "^DJI", "INDEX:COMP": "^IXIC", "INDEX:NDX": "^NDX",
+    "INDEX:SPX": "^GSPC", "INDEX:VIX": "^VIX",
+}
+
 CHOSUNG = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
 _CHOSUNG_SET = set(CHOSUNG)
 
@@ -420,6 +427,21 @@ class SymbolBook:
         if item := self._yahoo.get(code):
             return self._yahoo_symbol(code, item)
         return self._by_code.get(code) or self._known.get(code)
+
+    async def yahoo_chart_ticker(self, code: str) -> str | None:
+        if is_index(code):
+            return YAHOO_BENCHMARK_TICKERS.get(code)
+        if OVERSEAS_RE.fullmatch(code):
+            return ticker(code).replace(".", "-")
+        if DOMESTIC_RE.fullmatch(code):
+            symbol = self.get(code)
+            if symbol is None or not symbol.market:
+                await self.wait_ready(3.0)
+                symbol = self.get(code)
+            suffix = {"KOSPI": ".KS", "KOSDAQ": ".KQ"}.get(symbol.market) if symbol else None
+            if suffix:
+                return code + suffix
+        return None
 
     @staticmethod
     def _yahoo_symbol(code: str, item: YahooInstrument) -> Symbol:
