@@ -1,12 +1,23 @@
-# KIS Tradingview
+# KIS TradingView
 
-한국투자증권(KIS) Open API 시세로 차트를 띄우고, TradingView처럼 차트 위에 선을 긋는 개인용 웹 도구입니다.
+한국투자증권(KIS)과 Yahoo Finance 시세를 한 화면에서 조회하는 Windows·Android용 개인 차트 앱입니다. 브라우저에서도 실행할 수 있습니다. 차트 렌더링에는 TradingView가 공개한 Lightweight Charts™ v5를 사용합니다. [차트 라이브러리](https://github.com/tradingview/lightweight-charts) · [Apache 2.0 라이선스](web/vendor/lightweight-charts.LICENSE)
 
-- 차트: [Lightweight Charts](https://github.com/tradingview/lightweight-charts) v5 (Apache-2.0, `web/vendor`에 포함)
-- 서버: Python FastAPI (KIS 키를 브라우저에 노출하지 않기 위해 서버를 거칩니다)
-- KIS 키가 없으면 **MOCK(가짜 시세)** 로 실행되므로 바로 화면을 확인할 수 있습니다.
+| 보고 싶은 차트 | 검색 예시 | 시세 연결 |
+|---|---|---|
+| 국내·미국 주식 | 삼성전자, `005930`, 애플, `AAPL` | 한투 로그인. 국내 기본 거래소는 KRX |
+| 국내·미국 지수 | 코스피, 나스닥100, VIX | 한투 로그인. 지수별로 제공하는 봉 주기가 다름 |
+| 선물·환율·변동성 지수 | `NQ=F`, `USD/KRW`, `^VIX` | Yahoo Finance. 한투 로그인 없이 온라인 조회 |
+
+이동평균선·볼린저 밴드·일목균형표를 차트에 추가하고, 가격·지표선·직접 그린 추세선에 돌파 알림을 설정할 수 있습니다. **데모로 시작**을 선택하면 예시 시세로 그리기와 알림을 사용해 볼 수 있습니다.
 
 ## 실행
+
+소스에서 시작하려면 Git과 Python 3.10 이상을 설치하고 아래 명령으로 이 버전을 받으세요. 이미 `TradingView.exe`가 있으면 바로 실행할 수 있습니다.
+
+```shell
+git clone --branch feature/overseas-stocks https://github.com/JunmuYOUN/TradingView_KIS.git
+cd TradingView_KIS
+```
 
 ### Windows
 
@@ -16,9 +27,14 @@
 
 국내 시세의 기본 거래소는 KRX입니다. 상단 **설정 → 국내 시세 거래소**에서 KRX, NXT 또는 KRX + NXT 통합을 선택하면 국내 차트에 바로 적용됩니다. **차트**를 누르면 차트 화면으로 돌아갑니다. 선택은 로그아웃하거나 앱을 다시 열어도 유지됩니다. 프로젝트 폴더에서 실행하면 `data/`에 저장한 선도 이어서 쓸 수 있습니다.
 
-실행 파일을 다시 만들려면 Python 3.10 이상으로 `python -m venv .venv`를 실행한 뒤 PowerShell에서 `./build-desktop.ps1`을 실행합니다.
+Windows 실행 파일을 만들려면 프로젝트 폴더에서 PowerShell로 아래 명령을 실행하세요. 같은 폴더에 `TradingView.exe`가 생성됩니다.
 
-**브라우저:** `run.bat`을 더블클릭합니다. 처음 실행할 때 `.venv` 가상환경을 만들고 패키지를 설치하며, 이후에는 서버가 켜지고 브라우저가 열립니다.
+```powershell
+python -m venv .venv
+.\build-desktop.ps1 -SkipAndroid
+```
+
+**브라우저에서 실행하려면** `run.bat`을 더블클릭하세요. 처음 실행할 때 가상환경을 만들고 필요한 패키지를 설치한 뒤 브라우저를 엽니다.
 
 ### macOS / Linux
 
@@ -28,10 +44,10 @@
 
 ### 직접 실행
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate          # macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
+가상환경을 활성화한 터미널에서 실행합니다.
+
+```shell
+python -m pip install -r requirements.txt
 python -m server.main
 ```
 
@@ -39,7 +55,11 @@ python -m server.main
 
 ### Android
 
-안드로이드 앱의 소스와 Gradle 래퍼는 `android/`에 있습니다. APK는 이 프로젝트의 `server/`, `web/`, `desktop_login.py`를 함께 포함합니다. 처음 빌드할 때는 `android/README.md`의 도구 설치 절차를 따르세요. 이후 `./build-desktop.ps1`로 두 앱을 함께 빌드하거나 `./android/build-android.ps1 -NoInstall`로 APK만 만들 수 있습니다. 기존 설치의 SDK와 서명 키도 이어서 사용할 수 있습니다.
+Android 앱은 기기 안에서 같은 서버와 차트 화면을 실행합니다. Android 빌드 도구를 준비한 다음 프로젝트 루트에서 아래 명령을 실행하면 `android/TradingView.apk`가 생성됩니다. 기존 설치의 SDK와 서명 키도 이어서 사용할 수 있습니다. [Android 빌드 도구 설치 및 기기 테스트](android/README.md)
+
+```powershell
+.\android\build-android.ps1 -NoInstall
+```
 
 ## KIS 키 연결
 
@@ -60,12 +80,12 @@ python -m server.main
 
 - App Key·App Secret(`data/kis_credentials.bin`), 접근토큰(`data/kis_token_*.bin`)은 Windows DPAPI로 **현재 Windows 사용자 계정**에 묶어 암호화합니다. 파일을 다른 계정이나 다른 PC로 복사하면 풀리지 않으므로, 옮긴 뒤에는 키를 다시 연결해야 합니다.
 - 예전 버전이 `.env`에 평문으로 저장한 키는 Windows에서 새 버전을 처음 켤 때 암호화 저장소로 옮기고 `.env`에서는 값을 지웁니다. 평문 토큰 캐시(`data/kis_token_*.json`, `data/kis_approval_*.json`)는 서버를 켤 때 지웁니다. 이전 버전의 웹소켓 접속키 캐시도 정리합니다.
-- Windows가 아닌 운영체제에서는 토큰을 디스크에 남기지 않고 메모리에만 둡니다. 그래서 서버를 다시 켜면 토큰을 새로 발급받습니다.
+- Android 앱은 기기의 Android Keystore에서 생성한 AES-256-GCM 키로 KIS 키와 접근 토큰을 암호화하고 앱 전용 저장소에 보관합니다. macOS·Linux에서 브라우저 서버로 실행할 때는 접근 토큰을 메모리에만 둡니다.
 
 ## 실시간 연결 보안
 
 - 국내·미국 주식은 선택한 봉의 최신 가격과 거래량을 인증서 검증이 켜진 한투 HTTPS API에서 받습니다. 조회가 끝난 뒤 5초 후에 다시 조회하며, 오류가 반복되면 간격을 최대 60초까지 늘립니다. 갱신 사이의 개별 체결은 표시하지 않습니다.
-- **앱 내부(창 ↔ 로컬 서버):** 로컬 서버는 다른 웹사이트가 보낸 요청(Origin·Sec-Fetch-Site 검사)과 DNS 리바인딩(Host 검사)을 거부합니다. 데스크톱 앱은 실행할 때마다 새 일회용 토큰으로 앱 창에만 세션 쿠키(HttpOnly, SameSite=Strict)를 주므로, 같은 PC의 다른 사용자나 프로그램은 실시간 웹소켓과 API에 붙을 수 없습니다.
+- 데스크톱 앱과 브라우저 실행 모두 일회용 시작 주소를 세션 쿠키(`HttpOnly`, `SameSite=Strict`)로 교환합니다. 서버는 API와 웹소켓 요청에서 쿠키와 접속 호스트를 검사하고, 다른 웹사이트에서 온 요청을 거부합니다. 외부 접속에는 HTTPS가 필요합니다.
 
 ## 사용법
 
@@ -125,6 +145,7 @@ NXT는 2025년 3월 4일에 거래를 시작했습니다. 그보다 오래된 �
 - 차트에 그린 **추세선·연장선·수평선**은 선을 선택한 뒤 편집창에서 **얼러트**를 누릅니다. 추세선은 두 점 사이를 감시합니다. 두 번째 점 너머까지 감시하려면 연장선을 사용하세요.
 - 얼러트는 기본으로 앱에 한 번 표시됩니다. **계속 알림**을 체크하면 선택한 방향으로 다시 돌파할 때마다 알림이 표시됩니다. 등록한 뒤에도 얼러트 목록에서 체크하거나 해제할 수 있습니다.
 - 지표·그리기 얼러트는 등록한 종목과 봉 주기의 실시간 차트에서 작동합니다. 지표나 선을 삭제하면 연결된 얼러트도 삭제됩니다.
+- Windows에서는 앱 안에 알림이 표시됩니다. Android에서는 휴대폰 알림을 허용하면 현재 종목의 알림을 백그라운드에서도 받을 수 있습니다. 앱을 완전히 종료하면 감시가 끝납니다. [Android 알림과 진동 설정](android/README.md#얼러트-알림)
 - 조회가 끊겼다가 다시 연결되면 마지막으로 확인한 봉부터 시세를 이어 받아 봉별로 돌파를 확인합니다. 제공처에서 그 구간을 복구할 수 없으면 차트에 **시세 공백 있음**을 표시하고 새 기준값부터 알림을 재개합니다.
 - **리플레이**에서는 시작 봉을 선택하고 과거 봉을 한 개씩 넘기거나 연속 재생할 수 있습니다. **실시간으로**를 누르면 최신 봉으로 돌아갑니다.
 
@@ -153,16 +174,9 @@ NXT는 2025년 3월 4일에 거래를 시작했습니다. 그보다 오래된 �
 - 선은 (시각, 가격)으로 저장되므로 타임프레임을 바꿔도 같은 자리에 남습니다. 종목별로 `data/drawings/<종목코드>.json`에 자동 저장됩니다.
 - 전송 대기 중인 편집은 같은 브라우저의 로컬 저장소에 보관하고 다음 실행에서 저장을 다시 시도합니다. 두 창이 같은 종목의 그림을 수정하면 저장 상태 옆에서 유지할 버전을 고를 수 있습니다.
 
-## 다른 컴퓨터에서 쓰기
+## 그린 선을 다른 PC로 옮기기
 
-```bash
-git clone <이 저장소 주소> KIS_Tradingview
-cd KIS_Tradingview
-copy .env.example .env      # 키 입력 (macOS/Linux: cp)
-run.bat                     # macOS/Linux: ./run.sh
-```
-
-그린 선까지 컴퓨터 사이에서 공유하고 싶다면 `.gitignore`에 `!data/drawings/` 한 줄을 추가하고 커밋하면 됩니다.
+원래 PC에서 그림의 저장 상태가 **저장됨**인지 확인하세요. 새 PC에서 앱을 종료한 뒤 옮길 종목의 JSON 파일을 기존 `data/drawings/`에서 새 앱의 같은 폴더로 복사합니다. 새 PC에 같은 종목의 그림이 있으면 그 파일을 먼저 백업하세요. 한투 계정은 새 PC에서 다시 로그인합니다.
 
 ## 회귀 테스트
 
@@ -211,7 +225,7 @@ web/
 | 미국 지수 분봉 | FHKST03030200 `overseas-price/.../inquire-time-indexchartprice` | 102건 |
 
 - 접근토큰은 하루 동안 유효하고 1분에 1회만 발급되므로 `data/kis_token_*.bin`에 암호화해 캐시합니다.
-- 초당 호출 제한(실전 20건, 모의 5건)을 넘지 않도록 서버가 호출 간격을 조절합니다.
+- 서버의 기본 조회 속도는 실전 초당 15회, 모의 초당 4회입니다. 환경 변수 `KIS_RATE_PER_SEC`로 조정할 수 있습니다.
 - 지난 날짜의 분봉은 `data/cache/`에 저장해 두므로, 같은 종목은 두 번째부터 빠르게 열립니다.
 - 국내 3·5·15·30·60분봉은 1분봉을 서버에서 묶어서 만듭니다. 해외 분봉은 KIS에서 그 분봉 그대로 받습니다(60분봉 15일치가 2번 호출). 분봉의 기본 조회 기간은 `server/main.py`의 `DEFAULT_DAYS`에서 바꿀 수 있습니다.
 
