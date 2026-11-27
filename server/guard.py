@@ -71,6 +71,7 @@ class LocalGuard:
                     self._launch = None
                     response = RedirectResponse("/", status_code=303, headers={
                         "cache-control": "no-store", "referrer-policy": "no-referrer",
+                        "clear-site-data": '"cache"',
                     })
                     response.set_cookie(self.cookie, self.session, httponly=True, samesite="strict", path="/",
                                         secure=scope["scheme"] == "https")

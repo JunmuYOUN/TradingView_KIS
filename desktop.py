@@ -55,6 +55,7 @@ def running_server():
 
     app.state.initial_settings = load_startup_settings()
     app.state.desktop = True
+    app.state.drawing_sync_role = "desktop"
     # 이 실행에서만 쓰는 세션 쿠키를 앱 창에만 줍니다. 다른 사이트·다른 사용자의 접속은 거부됩니다.
     guard = LocalGuard(app, host=HOST, port=PORT, require_session=True)
     config = uvicorn.Config(

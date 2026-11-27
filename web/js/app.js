@@ -2,6 +2,7 @@ import { TIMEFRAMES, bucketStart, isMinuteTf, tfSeconds } from './timeframe.js';
 import { TimeMap } from './timemap.js';
 import { DrawingManager, setPriceDecimals } from './drawings.js';
 import { createDrawingPersistence } from './drawing-persistence.js';
+import { setupDrawingSync } from './drawing-sync.js';
 import { setupDrawingToolbar } from './toolbar.js';
 import { setupChartTypes } from './chart-types.js';
 import { createIndicators, INDICATORS } from './indicators.js';
@@ -298,6 +299,7 @@ async function loadCandles({ keepRange = false, preserveHistory = false } = {}) 
 
 const drawingPath = code => '/api/drawings/' + encodeURIComponent(code);
 const drawingStore = createDrawingPersistence({
+  mergeChanges: () => Boolean(state.config?.drawing_sync_role),
   storage: localStorage,
   read: code => api(drawingPath(code)),
   async write(code, base, text) {
@@ -320,10 +322,12 @@ const drawingStore = createDrawingPersistence({
 drawings.onChange = () => drawingStore.change(drawings.toJSON());
 $('#drawing-retry').onclick = () => drawingStore.retry();
 $('#drawing-keep').onclick = () => {
-  if (confirm('서버에 저장된 그림을 현재 편집본으로 바꿀까요?')) drawingStore.resolve(true);
+  const prompt = state.config?.drawing_sync_role ? '충돌한 그림에 이 창의 편집을 적용할까요?' : '서버에 저장된 그림을 현재 편집본으로 바꿀까요?';
+  if (confirm(prompt)) drawingStore.resolve(true);
 };
 $('#drawing-reload').onclick = () => {
-  if (confirm('현재 편집본을 버리고 서버의 그림을 불러올까요?')) drawingStore.resolve(false);
+  const prompt = state.config?.drawing_sync_role ? '충돌한 그림에 서버의 편집을 적용할까요?' : '현재 편집본을 버리고 서버의 그림을 불러올까요?';
+  if (confirm(prompt)) drawingStore.resolve(false);
 };
 window.addEventListener('online', drawingStore.recover);
 document.addEventListener('visibilitychange', () => { if (document.hidden) drawingStore.flushAll(); });
@@ -1119,6 +1123,8 @@ async function init() {
   setupSettings();
   try {
     state.config = await api('/api/config');
+    if (state.config.drawing_sync_role) setupDrawingSync(state.config.drawing_sync_role, api,
+      () => drawingStore.refresh(() => !drawings.draft && !drawings.drag && !drawings.brushing));
     state.quoteTransport = state.config.quote_transport;
     $('#view-tabs').hidden = !!state.config.desktop;
     $('#domestic-market').value = state.config.market;

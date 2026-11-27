@@ -88,6 +88,26 @@
     </select>
     <span id="market-status" role="status"></span>
     <label class="price-fit-setting"><input id="fit-price-on-symbol" type="checkbox" checked> 종목 변경 시 가격축 자동 맞춤</label>
+    <section id="drawing-sync" aria-labelledby="sync-title" hidden>
+      <h2 id="sync-title">그림 동기화</h2>
+      <p id="sync-status" role="status">연결 상태 확인 중…</p>
+      <button id="sync-invite" type="button" hidden>휴대폰 연결</button>
+      <div id="sync-invitation" hidden>
+        <p>같은 와이파이에서 휴대폰 앱의 설정을 열고 QR을 스캔하세요.</p>
+        <canvas id="sync-qr" aria-label="기기 연결 QR 코드" role="img"></canvas>
+        <p id="sync-code"></p>
+      </div>
+      <form id="sync-pair" hidden>
+        <button id="sync-scan" type="button">PC의 QR 스캔</button>
+        <details id="sync-manual"><summary>연결 코드 직접 입력</summary>
+          <label>PC 주소 <input name="address" placeholder="192.168.1.10" inputmode="decimal" maxlength="15" autocomplete="off"></label>
+          <label>연결 코드 <input name="code" maxlength="30" autocomplete="off" autocapitalize="characters" spellcheck="false"></label>
+          <button type="submit">연결</button>
+        </details>
+      </form>
+      <button id="sync-unlink" type="button" hidden>기기 연결 해제</button>
+      <p id="sync-error" role="alert"></p>
+    </section>
     <button id="show-license" type="button">오픈소스 정보</button>
   </section>
 

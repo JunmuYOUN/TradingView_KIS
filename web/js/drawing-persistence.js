@@ -2,7 +2,54 @@
 const prefix = 'kis.pendingDrawings.v1.';
 const empty = '[]';
 
-export function createDrawingPersistence({ read, write, storage, display, status, delay = 350 }) {
+// A LAN packet can change JSON key order inside points and styles.
+function sameValue(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false;
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every(key =>
+    Object.prototype.hasOwnProperty.call(b, key) && sameValue(a[key], b[key]));
+}
+
+function sameSnapshot(a, b) {
+  return a === b || (typeof a === 'string' && typeof b === 'string' && sameValue(JSON.parse(a), JSON.parse(b)));
+}
+
+function drawingMap(items) {
+  return new Map(items.map(item => [item.id, item]));
+}
+
+// A save can succeed before the browser closes. If another device subsequently
+// adds a line, the returned document still includes that intermediate save.
+function mergeBaseline(draft, remote) {
+  const original = JSON.parse(draft.original);
+  if (!draft.sent || draft.sent === draft.text) return original;
+  const sent = JSON.parse(draft.sent);
+  const base = drawingMap(original), saved = drawingMap(sent), latest = drawingMap(remote);
+  for (const id of new Set([...base.keys(), ...saved.keys()])) {
+    if (!sameValue(base.get(id), saved.get(id)) && !sameValue(saved.get(id), latest.get(id))) return original;
+  }
+  return sent;
+}
+
+// An explicit choice resolves only overlapping edits; independent edits on both devices survive.
+function mergeIndependentEdits(original, local, remote, choice = null) {
+  const baseline = drawingMap(original), edits = drawingMap(local), result = drawingMap(remote);
+  if ([baseline, edits, result].some(map => map.has(undefined))) return null;
+  for (const id of new Set([...baseline.keys(), ...edits.keys()])) {
+    const before = baseline.get(id), after = edits.get(id), other = result.get(id);
+    if (sameValue(before, after)) continue;
+    if (!sameValue(other, before) && !sameValue(other, after)) {
+      if (choice === null) return null;
+      if (choice === 'remote') continue;
+    }
+    if (edits.has(id)) result.set(id, edits.get(id));
+    else result.delete(id);
+  }
+  return [...result.values()];
+}
+
+export function createDrawingPersistence({ read, write, storage, display, status, mergeChanges = () => false, delay = 350 }) {
   const entries = new Map();
   let active = null;
   let shown = null;
@@ -50,9 +97,10 @@ export function createDrawingPersistence({ read, write, storage, display, status
     if (active !== e) return;
     const text = e.draft?.text ?? e.server;
     if (shown !== text) {
+      const redraw = !sameSnapshot(shown, text);
       shown = text;
       // The drawing manager modifies objects on edit and repairs IDs in older files.
-      display(JSON.parse(text));
+      if (redraw) display(JSON.parse(text));
     }
     report(e);
   }
@@ -66,23 +114,32 @@ export function createDrawingPersistence({ read, write, storage, display, status
     const draft = e.draft;
     e.conflict = false;
     if (draft) {
-      if (draft.text === e.server) e.draft = null;
+      if (sameSnapshot(draft.text, e.server)) e.draft = null;
       else if (draft.base === null) {
         // Before the first successful read only new drawings were visible to the user.
         const additions = JSON.parse(draft.text);
         const byId = new Map(result.drawings.filter(Boolean).map(item => [item.id, item]));
         e.conflict = additions.some(item => byId.has(item.id) &&
-          JSON.stringify(byId.get(item.id)) !== JSON.stringify(item));
+          !sameValue(byId.get(item.id), item));
         if (!e.conflict) {
           draft.text = JSON.stringify([...result.drawings, ...additions.filter(item => !byId.has(item.id))]);
           draft.base = e.revision;
+          draft.original = e.server;
         }
-      } else if (draft.base === e.revision || draft.sent === e.server) {
+      } else if (draft.base === e.revision || sameSnapshot(draft.sent, e.server)) {
         draft.base = e.revision;
+        draft.original = e.server;
+      } else if (mergeChanges() && typeof draft.original === 'string') {
+        const merged = mergeIndependentEdits(mergeBaseline(draft, result.drawings), JSON.parse(draft.text), result.drawings);
+        if (merged) {
+          draft.text = JSON.stringify(merged);
+          draft.original = e.server;
+          draft.base = e.revision;
+        } else e.conflict = true;
       } else {
         e.conflict = true;
       }
-      if (!e.conflict && e.draft?.text === e.server) e.draft = null;
+      if (!e.conflict && e.draft && sameSnapshot(e.draft.text, e.server)) e.draft = null;
       persist(e);
     }
     present(e);
@@ -111,7 +168,7 @@ export function createDrawingPersistence({ read, write, storage, display, status
         e.server = sent;
         e.revision = result.revision;
         if (e.draft.text === sent) e.draft = null;
-        else { e.draft.base = e.revision; e.draft.sent = null; }
+        else { e.draft.base = e.revision; e.draft.original = sent; e.draft.sent = null; }
         persist(e);
       }
     } catch {
@@ -150,7 +207,7 @@ export function createDrawingPersistence({ read, write, storage, display, status
     if (!active) return;
     const e = active;
     shown = JSON.stringify(drawings);
-    if (!e.draft) e.draft = { base: e.revision, text: shown, sent: null };
+    if (!e.draft) e.draft = { base: e.revision, original: e.server, text: shown, sent: null };
     else e.draft.text = shown;
     persist(e);
     clearTimeout(e.timer);
@@ -174,11 +231,34 @@ export function createDrawingPersistence({ read, write, storage, display, status
 
   return {
     select, change, recover,
+    async refresh(canRefresh) {
+      const e = active;
+      const idle = () => e === active && !e.busy && !e.draft && canRefresh();
+      if (!e || !idle()) return false;
+      const revision = e.revision;
+      const remote = await read(e.code);
+      if (!idle() || revision !== e.revision) return false;
+      acceptRemote(e, remote);
+      return true;
+    },
     retry() { if (active) { active.needsRead = true; return flush(active); } },
     resolve(keepLocal) {
       const e = active;
       if (!e?.conflict) return;
-      if (keepLocal) e.draft.base = e.revision;
+      const draft = e.draft;
+      if (mergeChanges() && typeof draft.original === 'string') {
+        const latest = JSON.parse(e.server);
+        const merged = mergeIndependentEdits(mergeBaseline(draft, latest), JSON.parse(draft.text), latest,
+          keepLocal ? 'local' : 'remote');
+        if (merged) {
+          draft.text = JSON.stringify(merged);
+          draft.base = e.revision;
+          draft.original = e.server;
+          draft.sent = null;
+          if (sameSnapshot(draft.text, e.server)) e.draft = null;
+        } else if (keepLocal) draft.base = e.revision;
+        else e.draft = null;
+      } else if (keepLocal) draft.base = e.revision;
       else e.draft = null;
       e.conflict = false;
       persist(e);

@@ -67,11 +67,21 @@ async def lifespan(app: FastAPI):
     app.state.symbols.refresh_if_stale()  # 종목 마스터는 백그라운드에서 받습니다
     log.info("데이터 소스: %s (env=%s, market=%s)", app.state.source.name, settings.env, settings.market)
     del settings  # The lifespan generator must not retain credentials after logout.
+    role = getattr(app.state, "drawing_sync_role", None)
+    if role in {"desktop", "phone"}:
+        from .drawing_lan import DrawingLan
+
+        app.state.drawing_sync = DrawingLan(
+            DATA_DIR, mobile=role == "phone", wifi_available=getattr(app.state, "wifi_available", None),
+        )
+        await asyncio.to_thread(app.state.drawing_sync.start)
     if browser_url := getattr(app.state, "browser_url", None):
         del app.state.browser_url
         loop = asyncio.get_running_loop()
         loop.call_later(0.5, loop.run_in_executor, None, open_chart_browser, browser_url)
     yield
+    if role in {"desktop", "phone"}:
+        await asyncio.to_thread(app.state.drawing_sync.stop)
     await app.state.symbols.close()
     if app.state.source is not app.state.yahoo:
         await app.state.source.close()
@@ -157,6 +167,7 @@ async def api_config(request: Request):
     settings = request.app.state.settings
     return {"source": settings.source, "env": settings.env, "market": settings.market,
             "desktop": getattr(request.app.state, "desktop", False),
+            "drawing_sync_role": getattr(request.app.state, "drawing_sync_role", None),
             "quote_transport": "https" if settings.source in {"kis", "yahoo"} else "mock", "ws_tr_id": None}
 
 
@@ -369,6 +380,53 @@ async def latest_quotes(request: Request, code: str, tf: str = "D",
     return {"bars": bars, "source": source.name, "quote_status": status, "recovery": recovery, "next_before": next_before}
 
 
+def local_drawing_sync(request: Request, role: str | None = None):
+    sync = getattr(request.app.state, "drawing_sync", None)
+    if sync is None or (role and request.app.state.drawing_sync_role != role):
+        raise HTTPException(404, "이 기기에서 사용할 수 없는 기능입니다.")
+    return sync
+
+
+@app.get("/api/drawing-sync")
+def drawing_sync_status(request: Request):
+    return local_drawing_sync(request).status()
+
+
+@app.post("/api/drawing-sync/invite")
+def drawing_sync_invite(request: Request):
+    sync = local_drawing_sync(request, "desktop")
+    import qrcode
+
+    try:
+        invitation = sync.invite()
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from None
+    qr = qrcode.QRCode(border=4)
+    qr.add_data(f"KIS-DRAW-1 {invitation['address']} {invitation['code']}")
+    return JSONResponse({**invitation, "qr": qr.get_matrix()}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/drawing-sync/pair")
+async def drawing_sync_pair(request: Request):
+    sync = local_drawing_sync(request, "phone")
+    body = await json_body(request)
+    address, code = body.get("address", ""), body.get("code")
+    if not isinstance(address, str) or not isinstance(code, str) or len(address) > 50 or len(code) > 40:
+        raise HTTPException(400, "PC 주소와 연결 코드를 확인하세요.")
+    try:
+        await asyncio.to_thread(sync.pair, address.strip(), code.strip())
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from None
+    return sync.status()
+
+
+@app.post("/api/drawing-sync/unlink")
+def drawing_sync_unlink(request: Request):
+    sync = local_drawing_sync(request)
+    sync.unlink()
+    return sync.status()
+
+
 @app.get("/api/drawings/{code}")
 async def get_drawings(code: str):
     code = check_code(code)
@@ -442,10 +500,17 @@ async def ws_ticks(ws: WebSocket, code: str):
 
 @app.get("/")
 async def index():
-    return FileResponse(WEB_DIR / "index.html")
+    return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
-app.mount("/", StaticFiles(directory=WEB_DIR), name="web")
+class ChartAssets(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/", ChartAssets(directory=WEB_DIR), name="web")
 
 
 def open_chart_browser(url: str) -> None:

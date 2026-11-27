@@ -21,6 +21,18 @@ button, input, select { font: inherit; color: inherit; }
 #domestic-market { border: 1px solid #434651; border-radius: 4px; background: #1e222d; padding: 6px 10px; }
 #market-status { margin-left: 8px; color: #a9adba; }
 #market-status[data-kind="error"] { color: #ff6b6b; }
+#drawing-sync { border-top: 1px solid #303541; padding-top: 16px; margin-top: 24px; max-width: 480px; }
+#drawing-sync h2 { margin: 0; font-size: 16px; }
+#drawing-sync p { line-height: 1.5; color: #b8c1d2; }
+#drawing-sync button, #drawing-sync input { border: 1px solid #505666; border-radius: 5px; padding: 8px 12px; background: #242a36; }
+#drawing-sync button, #drawing-sync summary { cursor: pointer; }
+#drawing-sync details { margin: 12px 0; }
+#drawing-sync label { margin: 10px 0; }
+#drawing-sync input { display: block; margin-top: 4px; width: min(100%, 245px); }
+#sync-qr { width: min(200px, 100%); image-rendering: pixelated; }
+#sync-code { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+#drawing-sync #sync-error { color: #ff9292; }
+#sync-error:empty { display: none; }
 html:has(#drawing-presets[open]) { overflow: clip; }
 #drawing-presets { width: min(580px, 92vw); max-height: 85vh; overflow: auto; padding: 18px;
   background: #191a1e; color: #e4e5e8; color-scheme: dark; border: 1px solid #414348; border-radius: 8px; }
