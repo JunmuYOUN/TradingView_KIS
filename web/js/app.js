@@ -1,6 +1,6 @@
 import { TIMEFRAMES, bucketStart, isMinuteTf, tfSeconds } from './timeframe.js';
 import { TimeMap } from './timemap.js';
-import { DrawingManager, TOOLS } from './drawings.js';
+import { DrawingManager, TOOLS, setPriceDecimals } from './drawings.js';
 
 const LC = window.LightweightCharts;
 
@@ -18,6 +18,18 @@ const state = {
   saveTimer: null,
 };
 
+// 종목 코드: 국내 6자리(005930), 해외 거래소:티커(NAS:AAPL)
+const DOMESTIC_RE = /^(?=.*\d)[0-9A-Z]{6}$/;
+const OVERSEAS_RE = /^(NAS|NYS|AMS):[A-Z0-9][A-Z0-9.-]{0,15}$/;
+const isCode = (c) => DOMESTIC_RE.test(c) || OVERSEAS_RE.test(c);
+const isOverseas = (code) => code.includes(':');
+const tickerOf = (code) => (isOverseas(code) ? code.split(':')[1] : code);
+
+// 가격 표시: 국내는 원 단위, 해외는 달러 소수 2자리 (1달러 미만은 4자리)
+let priceDecimals = 0;
+const fmtPrice = (p) => p.toLocaleString('ko-KR', { minimumFractionDigits: priceDecimals, maximumFractionDigits: priceDecimals });
+const fmtInt = (x) => Math.round(x).toLocaleString('ko-KR');
+
 // ------------------------------------------------------------ 차트
 const container = $('#chart');
 const chart = LC.createChart(container, {
@@ -27,7 +39,7 @@ const chart = LC.createChart(container, {
   crosshair: { mode: LC.CrosshairMode.Normal },
   rightPriceScale: { borderColor: '#2a2e39' },
   timeScale: { borderColor: '#2a2e39', timeVisible: true, secondsVisible: false, rightOffset: 12 },
-  localization: { locale: 'ko-KR', priceFormatter: (p) => Math.round(p).toLocaleString('ko-KR') },
+  localization: { locale: 'ko-KR', priceFormatter: (p) => fmtPrice(p) },
 });
 
 const candles = chart.addSeries(LC.CandlestickSeries, {
@@ -56,13 +68,23 @@ async function api(path, opts) {
   return body;
 }
 
+function applyPriceFormat(code, bars) {
+  const last = bars.length ? bars[bars.length - 1].close : 0;
+  const d = isOverseas(code) ? (last > 0 && last < 1 ? 4 : 2) : 0;
+  if (d === priceDecimals) return;
+  priceDecimals = d;
+  setPriceDecimals(d);
+  candles.applyOptions({ priceFormat: { type: 'price', precision: d, minMove: 1 / 10 ** d } });
+}
+
 async function loadCandles({ keepRange = false } = {}) {
   const seq = ++state.loadSeq;
   const range = keepRange ? chart.timeScale().getVisibleLogicalRange() : null;
   setStatus('loading', '차트 불러오는 중…');
   try {
-    const { bars } = await api(`/api/candles?code=${state.code}&tf=${state.tf}`);
+    const { bars } = await api(`/api/candles?code=${encodeURIComponent(state.code)}&tf=${state.tf}`);
     if (seq !== state.loadSeq) return;
+    applyPriceFormat(state.code, bars);
     state.bars = bars;
     timeMap.setBars(bars, tfSeconds(state.tf), state.tf === 'D');
     candles.setData(bars.map((b) => ({ ...b }))); // 라이브러리가 객체를 건드리지 않도록 복사본 전달
@@ -79,7 +101,7 @@ async function loadCandles({ keepRange = false } = {}) {
 
 async function loadDrawings() {
   try {
-    const { drawings: list } = await api(`/api/drawings/${state.code}`);
+    const { drawings: list } = await api(`/api/drawings/${encodeURIComponent(state.code)}`);
     drawings.load(list);
   } catch (e) {
     drawings.load([]);
@@ -92,7 +114,7 @@ function scheduleSave() {
   const body = JSON.stringify({ drawings: drawings.toJSON() });
   state.saveTimer = setTimeout(async () => {
     try {
-      await api(`/api/drawings/${code}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body });
+      await api(`/api/drawings/${encodeURIComponent(code)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body });
       $('#saved').textContent = '저장됨';
     } catch (e) {
       $('#saved').textContent = '저장 실패';
@@ -136,7 +158,7 @@ function connectWs() {
   clearTimeout(state.wsRetry);
   const code = state.code;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws/ticks?code=${code}`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws/ticks?code=${encodeURIComponent(code)}`);
   state.ws = ws;
   let opened = false;
   ws.onopen = () => {
@@ -144,6 +166,9 @@ function connectWs() {
     setLive('connecting', '실시간 연결 중');
   };
   ws.onmessage = (ev) => {
+    // 종목을 바꾼 뒤 새 차트를 불러오는 동안에도 이전 종목의 연결이 잠시 남아 있습니다.
+    // 그 틱이 새 종목의 봉에 섞이지 않게 버립니다.
+    if (state.code !== code) return;
     const msg = JSON.parse(ev.data);
     if (msg.type === 'tick') {
       applyTick(msg);
@@ -186,13 +211,13 @@ function updateLegend(bar) {
   const prev = i > 0 ? state.bars[i - 1] : null;
   const chg = prev ? b.close - prev.close : 0;
   const pct = prev ? (chg / prev.close) * 100 : 0;
-  const f = (x) => Math.round(x).toLocaleString('ko-KR');
+  const f = fmtPrice;
   const cls = chg > 0 ? 'up' : chg < 0 ? 'down' : '';
   $('#legend').innerHTML =
     `<span>시 <b>${f(b.open)}</b></span><span>고 <b>${f(b.high)}</b></span>` +
     `<span>저 <b>${f(b.low)}</b></span><span>종 <b class="${cls}">${f(b.close)}</b></span>` +
     `<span class="${cls}">${chg >= 0 ? '+' : ''}${f(chg)} (${pct.toFixed(2)}%)</span>` +
-    `<span>거래량 <b>${f(b.volume)}</b></span>`;
+    `<span>거래량 <b>${fmtInt(b.volume)}</b></span>`;
 }
 
 chart.subscribeCrosshairMove((param) => {
@@ -248,26 +273,26 @@ function buildToolbar() {
 }
 
 // ------------------------------------------------------------ 종목 검색 · 검색 기록
-const CODE_RE = /^(?=.*\d)[0-9A-Z]{6}$/;
 const names = new Map(); // 종목코드 -> 종목명 (검색 결과·기록·서버 조회에서 알게 된 이름)
 const symbolInput = $('#symbol');
 const suggest = $('#suggest');
 const search = { mode: 'closed', list: [], active: -1, query: '', emptyText: '', seq: 0, timer: null, history: [] };
 
-// "삼성전자 005930" 이나 "005930" 에서 코드를 꺼냅니다 (KRX 코드에는 숫자가 들어 있습니다)
+// "삼성전자 005930", "005930", "NAS:AAPL" 에서 코드를 꺼냅니다 (KRX 코드에는 숫자가 들어 있습니다).
+// 거래소 없이 쓴 티커(AAPL)는 검색 결과에서 고릅니다.
 function parseCode(text) {
   const parts = String(text || '').trim().toUpperCase().split(/\s+/);
   const last = parts[parts.length - 1] || '';
-  return CODE_RE.test(last) ? last : null;
+  return isCode(last) ? last : null;
 }
 
 function symbolLabel(code) {
-  return `${names.get(code) || ''} ${code}`.trim();
+  return `${names.get(code) || ''} ${tickerOf(code)}`.trim();
 }
 
 function showSymbol(code) {
   if (document.activeElement !== symbolInput) symbolInput.value = symbolLabel(code);
-  document.title = `${names.get(code) || code} · KIS Tradingview`;
+  document.title = `${names.get(code) || tickerOf(code)} · KIS Tradingview`;
 }
 
 function learnNames(items) {
@@ -276,7 +301,7 @@ function learnNames(items) {
 
 async function lookupName(code) {
   try {
-    const s = await api(`/api/symbols/${code}`);
+    const s = await api(`/api/symbols/${encodeURIComponent(code)}`);
     if (s.name) names.set(code, s.name);
     if (state.code === code) showSymbol(code);
   } catch (e) { /* 이름을 몰라도 코드로 볼 수 있습니다 */ }
@@ -337,7 +362,8 @@ function renderSuggest() {
   search.list.forEach((item, i) => {
     const row = el('div', 'sg-item');
     row.setAttribute('role', 'option');
-    row.append(nameCell(item.name || '이름 모름', isHistory ? '' : search.query), el('span', 'sg-code', item.code),
+    row.append(nameCell(item.name || '이름 모름', isHistory ? '' : search.query),
+      el('span', 'sg-code', item.symbol || tickerOf(item.code)),
       el('span', 'sg-kind', item.kind && item.kind !== '주식' ? item.kind : item.market || ''));
     if (isHistory) {
       const del = el('button', 'sg-del', '×');
@@ -439,7 +465,7 @@ async function addHistory(code, name) {
 
 async function removeHistory(code) {
   try {
-    const { items } = await api(`/api/history/${code}`, { method: 'DELETE' });
+    const { items } = await api(`/api/history/${encodeURIComponent(code)}`, { method: 'DELETE' });
     search.history = items;
   } catch (e) {
     return;
@@ -508,8 +534,8 @@ function setupSearch() {
 }
 
 async function switchCode(code, { name = '', record = false } = {}) {
-  if (!CODE_RE.test(code || '')) {
-    setStatus('error', '종목명 일부나 6자리 종목코드를 입력해 목록에서 고르세요');
+  if (!isCode(code || '')) {
+    setStatus('error', '종목명 일부, 6자리 종목코드, 해외 티커를 입력해 목록에서 고르세요');
     return;
   }
   if (name) names.set(code, name);

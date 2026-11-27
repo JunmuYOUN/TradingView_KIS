@@ -7,7 +7,8 @@ import secrets
 import time
 from pathlib import Path
 
-from .symbols import CODE_RE, clean_name
+from .codes import normalize
+from .symbols import clean_name
 
 MAX_ITEMS = 20
 
@@ -27,7 +28,7 @@ class SearchHistory:
             if not isinstance(it, dict):
                 continue
             code = it.get("code")
-            if not isinstance(code, str) or not CODE_RE.match(code) or code in seen:
+            if not isinstance(code, str) or normalize(code) != code or code in seen:
                 continue
             at = it.get("at")
             seen.add(code)

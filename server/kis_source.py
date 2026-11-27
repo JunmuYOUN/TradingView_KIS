@@ -24,13 +24,18 @@ import httpx
 import websockets
 
 from . import vault
-from .bars import dedupe_sort, epoch_to_kst_parts as _parts, kst_epoch, now_epoch, now_kst
+from .bars import aggregate, dedupe_sort, epoch_to_kst_parts as _parts, kst_epoch, now_epoch, now_kst
+from .codes import is_overseas, split_overseas
 from .config import DATA_DIR, Settings
 from .hub import TickHub
 
 log = logging.getLogger("kis")
 
 QUOTE = "/uapi/domestic-stock/v1/quotations"
+OVERSEAS_QUOTE = "/uapi/overseas-price/v1/quotations"
+OVERSEAS_TR = "HDFSCNT0"     # 해외주식 실시간지연체결가 (미국은 지연 없음)
+OVERSEAS_MAX_PAGES = 12      # 해외 분봉 1회 조회당 최대 호출 수 (1페이지 120개)
+PERIOD_GUBN = {"D": "0", "W": "1", "M": "2"}
 MAX_WS_CODES = 40
 APPROVAL_TTL = 20 * 3600     # 웹소켓 접속키 재사용 시간 (유효기간 24시간)
 APPROVAL_MIN_REISSUE = 60    # 접속키 강제 재발급 최소 간격 (초)
@@ -233,10 +238,18 @@ class KisRealtimeHub(TickHub):
         self._send_lock = asyncio.Lock()
         self._connected_once = False
 
+    def _sub(self, code: str) -> tuple[str, str]:
+        """구독할 (TR, 키). 국내는 체결가 TR + 코드, 해외는 HDFSCNT0 + 'D'+거래소+티커 (예: DNASAAPL)."""
+        if is_overseas(code):
+            excd, symb = split_overseas(code)
+            return OVERSEAS_TR, f"D{excd}{symb}"
+        return self.s.ws_tr_id, code
+
     def _msg(self, key: str, code: str, tr_type: str) -> str:
+        tr_id, tr_key = self._sub(code)
         return json.dumps({
             "header": {"approval_key": key, "custtype": "P", "tr_type": tr_type, "content-type": "utf-8"},
-            "body": {"input": {"tr_id": self.s.ws_tr_id, "tr_key": code}},
+            "body": {"input": {"tr_id": tr_id, "tr_key": tr_key}},
         })
 
     async def _send(self, code: str, tr_type: str) -> None:
@@ -266,7 +279,8 @@ class KisRealtimeHub(TickHub):
     def _handle_data(self, raw: str) -> None:
         # 형식: 0|H0STCNT0|003|필드^필드^...   (암호화 데이터는 1| 로 시작, 체결가는 암호화되지 않음)
         parts = raw.split("|", 3)
-        if len(parts) < 4 or parts[0] != "0" or parts[1] != self.s.ws_tr_id:
+        overseas = len(parts) == 4 and parts[1] == OVERSEAS_TR
+        if len(parts) < 4 or parts[0] != "0" or (parts[1] != self.s.ws_tr_id and not overseas):
             return  # 구독하지 않은 TR 은 버립니다
         try:
             n = int(parts[2])
@@ -276,21 +290,28 @@ class KisRealtimeHub(TickHub):
             return
         fields = parts[3].split("^")
         width = len(fields) // n
-        if width < 13:
+        if width < (20 if overseas else 13):
             return
         today = now_kst().strftime("%Y%m%d")
         now = now_epoch()
-        subscribed = set(self.codes)
+        if overseas:  # 실시간 키(DNASAAPL) -> 종목 코드(NAS:AAPL)
+            subscribed = {self._sub(c)[1]: c for c in self.codes if is_overseas(c)}
+        else:
+            subscribed = {c: c for c in self.codes if not is_overseas(c)}
         for i in range(n):
             f = fields[i * width:(i + 1) * width]
-            code, hhmmss, price, vol = f[0], f[1], _num(f[2]), _num(f[12])
-            if code not in subscribed or not HHMMSS_RE.match(hhmmss):
+            if overseas:
+                # RSYM, SYMB, ZDIV, TYMD, XYMD(현지일자), XHMS(현지시각), KYMD, KHMS, OPEN, HIGH, LOW, LAST, ..., EVOL(19)
+                code, date, hhmmss, price, vol = subscribed.get(f[0]), f[4], f[5], _num(f[11]), _num(f[19])
+            else:
+                code, hhmmss, price, vol = subscribed.get(f[0]), f[1], _num(f[2]), _num(f[12])
+                date = f[33] if len(f) > 33 and DATE_RE.match(f[33]) else today  # BSOP_DATE
+            if code is None or not HHMMSS_RE.match(hhmmss) or not DATE_RE.match(date):
                 continue
             if not (0 < price < 1e8 and 0 <= vol < 1e12):
                 continue
-            date = f[33] if len(f) > 33 and DATE_RE.match(f[33]) else today  # BSOP_DATE
             try:
-                t = kst_epoch(date, hhmmss)
+                t = kst_epoch(date, hhmmss)  # 국내는 한국 시각, 해외는 현지 거래소 시각 기준
             except ValueError:
                 continue
             if not now - 3 * 86400 <= t <= now + 3600:
@@ -313,7 +334,8 @@ class KisRealtimeHub(TickHub):
                     if self._connected_once:
                         self.publish_all({"type": "resync"})  # 끊긴 구간을 REST 로 다시 받도록 알림
                     self._connected_once = True
-                    self.publish_all({"type": "status", "state": "live", "msg": f"KIS 실시간 ({self.s.ws_tr_id})"})
+                    self.publish_all({"type": "status", "state": "live",
+                                      "msg": f"KIS 실시간 (국내 {self.s.ws_tr_id} · 해외 {OVERSEAS_TR})"})
                     while self.codes:
                         raw = await asyncio.wait_for(ws.recv(), timeout=self.WATCHDOG_SEC)
                         if isinstance(raw, bytes):
@@ -335,8 +357,8 @@ class KisRealtimeHub(TickHub):
                         if body.get("rt_cd") not in (None, "0"):
                             msg = _clean(body.get("msg1", ""))
                             log.warning("KIS 웹소켓 응답: %s", msg)
-                            code = header.get("tr_key")
-                            if code in self.codes:
+                            code = {self._sub(c)[1]: c for c in self.codes}.get(header.get("tr_key"))
+                            if code:
                                 self.publish(code, {"type": "status", "state": "error", "msg": msg})
                             if "approval" in msg.lower() or "appkey" in msg.lower():
                                 await self.auth.approval_key(force=True)
@@ -378,8 +400,74 @@ class KisSource:
         self._mem: dict[tuple[str, str], list[dict]] = {}
         self._today: dict[str, tuple[str, list[dict]]] = {}
 
+    # ---- 해외 (미국)
+    async def _overseas_period(self, code: str, tf: str, count: int) -> list[dict]:
+        """해외주식 기간별시세 HHDFS76240000: 1회 100건, 기준일자(BYMD)를 앞으로 옮기며 받습니다."""
+        excd, symb = split_overseas(code)
+        out: list[dict] = []
+        bymd = ""
+        for _ in range(40):
+            body = await self.rest.get(f"{OVERSEAS_QUOTE}/dailyprice", "HHDFS76240000", {
+                "AUTH": "", "EXCD": excd, "SYMB": symb, "GUBN": PERIOD_GUBN[tf], "BYMD": bymd,
+                "MODP": "1",  # 수정주가
+                "KEYB": "",
+            })
+            rows = [r for r in body.get("output2") or [] if DATE_RE.match(str(r.get("xymd", "")))]
+            if not rows:
+                break
+            for r in rows:
+                o, h, l, c = (_num(r.get(k)) for k in ("open", "high", "low", "clos"))
+                if c <= 0:
+                    continue
+                out.append({"time": kst_epoch(r["xymd"]), "open": o or c, "high": h or c, "low": l or c,
+                            "close": c, "volume": _num(r.get("tvol"))})
+            oldest = min(r["xymd"] for r in rows)
+            if len(out) >= count or len(rows) < 100:
+                break
+            bymd = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        return dedupe_sort(out)[-count:]
+
+    @staticmethod
+    def _overseas_minute_row(r: dict) -> dict | None:
+        d, h = str(r.get("xymd", "")), str(r.get("xhms", ""))
+        c = _num(r.get("last"))
+        if not DATE_RE.match(d) or not HHMMSS_RE.match(h) or c <= 0:
+            return None
+        o, hi, lo = _num(r.get("open")), _num(r.get("high")), _num(r.get("low"))
+        return {"time": kst_epoch(d, h), "open": o or c, "high": hi or c, "low": lo or c, "close": c,
+                "volume": _num(r.get("evol"))}
+
+    async def _overseas_minutes(self, code: str, days: int, tf: str) -> list[dict]:
+        """해외주식분봉조회 HHDFS76950200. tf 분봉을 KIS 에서 바로 받습니다 (현지 시각, 시간외 포함).
+
+        다음 페이지는 NEXT=1, KEYB=이전 페이지에서 가장 오래된 봉의 현지 일시(YYYYMMDDHHMMSS)로 받습니다.
+        """
+        excd, symb = split_overseas(code)
+        bars: dict[int, dict] = {}
+        nxt, keyb = "", ""
+        for _ in range(OVERSEAS_MAX_PAGES):
+            body = await self.rest.get(f"{OVERSEAS_QUOTE}/inquire-time-itemchartprice", "HHDFS76950200", {
+                "AUTH": "", "EXCD": excd, "SYMB": symb, "NMIN": tf, "PINC": "1",  # 전일 포함
+                "NEXT": nxt, "NREC": "120", "FILL": "", "KEYB": keyb,
+            })
+            page = [b for b in (self._overseas_minute_row(r) for r in body.get("output2") or []) if b]
+            new = [b for b in page if b["time"] not in bars]
+            if not new:
+                break
+            for b in new:
+                bars[b["time"]] = b
+            oldest = min(b["time"] for b in page)
+            if len({_parts(t)[0] for t in bars}) > days:
+                break  # 필요한 날짜보다 하루 더 받았으면 충분합니다
+            nxt, keyb = "1", "".join(_parts(oldest))
+        out = dedupe_sort(list(bars.values()))
+        keep = sorted({_parts(b["time"])[0] for b in out})[-days:]
+        return [b for b in out if _parts(b["time"])[0] in keep]
+
     # ---- 일/주/월봉
     async def period_bars(self, code: str, tf: str, count: int) -> list[dict]:
+        if is_overseas(code):
+            return await self._overseas_period(code, tf, count)
         end = now_kst().strftime("%Y%m%d")
         out: list[dict] = []
         for _ in range(30):
@@ -538,11 +626,14 @@ class KisSource:
         except Exception as e:
             log.warning("분봉 캐시 저장 실패: %s", e)
 
-    async def minute_bars(self, code: str, days: int) -> list[dict]:
+    async def minute_bars(self, code: str, days: int, tf: str = "1") -> list[dict]:
+        if is_overseas(code):
+            return await self._overseas_minutes(code, days, tf)
         today = await self._today_minutes(code)
         past_days = days - (1 if today else 0)
         past = await self._past_minutes(code, past_days) if past_days > 0 else []
-        return dedupe_sort(past + today)
+        bars = dedupe_sort(past + today)
+        return bars if tf == "1" else aggregate(bars, tf)
 
     async def close(self) -> None:
         await self.hub.close()

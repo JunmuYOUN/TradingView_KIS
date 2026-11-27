@@ -32,7 +32,12 @@ export const FIB_LEVELS = [
 const HIT_PX = 6;
 const ANCHOR_R = 5;
 
-const fmtPrice = (p) => Math.round(p).toLocaleString('ko-KR');
+// 가격 표시 소수 자릿수: 국내 0 (원), 해외 2 (달러). 종목을 바꿀 때 app.js 가 맞춥니다.
+let priceDecimals = 0;
+export function setPriceDecimals(n) {
+  priceDecimals = n;
+}
+const fmtPrice = (p) => p.toLocaleString('ko-KR', { minimumFractionDigits: priceDecimals, maximumFractionDigits: priceDecimals });
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 
 function hexToRgba(hex, a) {

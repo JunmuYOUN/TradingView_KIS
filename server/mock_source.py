@@ -11,6 +11,7 @@ import random
 import zlib
 
 from .bars import aggregate, bucket_start, now_epoch, tick_size
+from .codes import is_overseas
 from .hub import TickHub
 
 MAX_MINUTE_DAYS = 30
@@ -22,8 +23,12 @@ def _round_tick(p: float) -> float:
     return float(max(ts, round(p / ts) * ts))
 
 
+def _round_cent(p: float) -> float:
+    return max(0.01, round(p, 2))
+
+
 def _walk_backward(rng: random.Random, last_close: float, n: int, vol: float, cycle: float,
-                   trend: float) -> list[tuple]:
+                   trend: float, rounder=_round_tick) -> list[tuple]:
     """마지막 종가에서 시작해 과거 방향으로 n 개의 (open, high, low, close) 를 만듭니다."""
     closes = [last_close]
     drift_phase = rng.random() * 6.28
@@ -39,7 +44,7 @@ def _walk_backward(rng: random.Random, last_close: float, n: int, vol: float, cy
         o = prev
         hi = max(o, c) * (1 + abs(rng.gauss(0, vol * 0.6)))
         lo = min(o, c) * (1 - abs(rng.gauss(0, vol * 0.6)))
-        o, hi, lo, cr = (_round_tick(x) for x in (o, hi, lo, c))
+        o, hi, lo, cr = (rounder(x) for x in (o, hi, lo, c))
         hi = max(hi, o, cr)
         lo = min(lo, o, cr)
         out.append((o, hi, lo, cr))
@@ -51,13 +56,20 @@ class _MockSymbol:
     def __init__(self, code: str) -> None:
         seed = zlib.crc32(code.encode())
         self.rng = random.Random(seed)
-        base = 5000 + (seed % 200) * 1000          # 5,000 ~ 204,000 원
-        self.price = _round_tick(float(base))
+        self.overseas = is_overseas(code)
+        if self.overseas:
+            self.round = _round_cent
+            base = 20 + (seed % 400) + (seed % 100) / 100  # 20 ~ 420 달러
+        else:
+            self.round = _round_tick
+            base = 5000 + (seed % 200) * 1000          # 5,000 ~ 204,000 원
+        self.price = self.round(float(base))
         now = now_epoch()
         cur_min = bucket_start(now, "1")
 
         n_min = MAX_MINUTE_DAYS * 1440
-        ohlc = _walk_backward(self.rng, self.price, n_min, vol=0.0022, cycle=240.0, trend=0.08)
+        ohlc = _walk_backward(self.rng, self.price, n_min, vol=0.0022, cycle=240.0, trend=0.08,
+                              rounder=self.round)
         t0 = cur_min - (n_min - 1) * 60
         self.minutes: list[dict] = [
             {"time": t0 + i * 60, "open": o, "high": h, "low": l, "close": c,
@@ -75,7 +87,8 @@ class _MockSymbol:
                 days.append(d)
             d -= 86400
         days.reverse()
-        dohlc = _walk_backward(self.rng, self.price, len(days), vol=0.018, cycle=25.0, trend=0.15)
+        dohlc = _walk_backward(self.rng, self.price, len(days), vol=0.018, cycle=25.0, trend=0.15,
+                               rounder=self.round)
         self.daily: list[dict] = [
             {"time": t, "open": o, "high": h, "low": l, "close": c,
              "volume": float(self.rng.randint(200_000, 5_000_000))}
@@ -96,10 +109,10 @@ class _MockSymbol:
                 bars.append({"time": s, "open": p, "high": p, "low": p, "close": p, "volume": v})
 
     def next_tick(self) -> tuple[int, float, float]:
-        ts = tick_size(self.price)
+        ts = 0.01 * self.rng.randint(1, 5) if self.overseas else tick_size(self.price)
         r = self.rng.random()
         step = 0 if r < 0.85 else (1 if r < 0.925 else -1)
-        p = _round_tick(self.price + step * ts)
+        p = self.round(self.price + step * ts)
         v = float(self.rng.randint(1, 300))
         return now_epoch(), p, v
 
@@ -147,10 +160,11 @@ class MockSource:
             self._symbols[code] = _MockSymbol(code)
         return self._symbols[code]
 
-    async def minute_bars(self, code: str, days: int) -> list[dict]:
+    async def minute_bars(self, code: str, days: int, tf: str = "1") -> list[dict]:
         sym = self.symbol(code)
         n = min(days, MAX_MINUTE_DAYS) * 1440
-        return [dict(b) for b in sym.minutes[-n:]]
+        bars = [dict(b) for b in sym.minutes[-n:]]
+        return bars if tf == "1" else aggregate(bars, tf)
 
     async def period_bars(self, code: str, tf: str, count: int) -> list[dict]:
         daily = [dict(b) for b in self.symbol(code).daily]

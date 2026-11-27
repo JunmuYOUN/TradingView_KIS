@@ -8,7 +8,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import webbrowser
 from contextlib import asynccontextmanager
 
@@ -16,7 +15,8 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .bars import MINUTE_TFS, PERIOD_TFS, aggregate
+from . import codes
+from .bars import MINUTE_TFS, PERIOD_TFS
 from .config import DATA_DIR, WEB_DIR, Settings, load_settings, remove_legacy_plaintext
 from .guard import LocalGuard
 from .history import SearchHistory
@@ -27,7 +27,6 @@ from .symbols import SymbolBook, clean_name
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
 
-CODE_RE = re.compile(r"^[0-9A-Z]{6}$")
 DRAW_DIR = DATA_DIR / "drawings"
 MAX_WS_CLIENTS = 16          # 동시에 붙을 수 있는 실시간 웹소켓 수
 WS_CLIENT_MAX_MESSAGE = 4096  # 화면은 웹소켓으로 거의 보내는 것이 없으므로 작게 제한합니다
@@ -69,10 +68,10 @@ app = FastAPI(title="KIS Tradingview", lifespan=lifespan)
 
 
 def check_code(code: str) -> str:
-    code = code.strip().upper()
-    if not CODE_RE.match(code):
-        raise HTTPException(400, "종목코드는 6자리여야 합니다 (예: 005930)")
-    return code
+    normalized = codes.normalize(code)
+    if not normalized:
+        raise HTTPException(400, "종목코드는 6자리(예: 005930) 또는 거래소:티커(예: NAS:AAPL) 형식이어야 합니다")
+    return normalized
 
 
 @app.exception_handler(Exception)
@@ -155,9 +154,7 @@ async def api_candles(code: str, tf: str = "D", days: int | None = Query(None, g
     src = app.state.source
     if tf in MINUTE_TFS:
         d = days or DEFAULT_DAYS[tf]
-        bars = await src.minute_bars(code, d)
-        if tf != "1":
-            bars = aggregate(bars, tf)
+        bars = await src.minute_bars(code, d, tf)  # 데이터 소스가 tf 분봉으로 묶어서 돌려줍니다
     elif tf in PERIOD_TFS:
         bars = await src.period_bars(code, tf, count or DEFAULT_COUNT[tf])
     else:
@@ -168,7 +165,7 @@ async def api_candles(code: str, tf: str = "D", days: int | None = Query(None, g
 @app.get("/api/drawings/{code}")
 async def get_drawings(code: str):
     code = check_code(code)
-    p = DRAW_DIR / f"{code}.json"
+    p = DRAW_DIR / f"{codes.file_stem(code)}.json"
     if not p.exists():
         return {"code": code, "drawings": []}
     return json.loads(p.read_text(encoding="utf-8"))
@@ -182,7 +179,7 @@ async def put_drawings(code: str, request: Request):
     if not isinstance(drawings, list):
         raise HTTPException(400, "drawings 배열이 필요합니다")
     DRAW_DIR.mkdir(parents=True, exist_ok=True)
-    p = DRAW_DIR / f"{code}.json"
+    p = DRAW_DIR / f"{codes.file_stem(code)}.json"
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps({"code": code, "drawings": drawings}, ensure_ascii=False, indent=1),
                    encoding="utf-8")

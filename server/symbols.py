@@ -1,6 +1,8 @@
 """종목 이름 검색.
 
-한국투자증권이 공개하는 종목 마스터(KOSPI·KOSDAQ, 키 불필요)를 받아 data/symbols.json 에 캐시합니다.
+한국투자증권이 공개하는 종목 마스터(키 불필요)를 받아 data/symbols.json 에 캐시합니다.
+- 국내: KOSPI·KOSDAQ (kospi_code.mst / kosdaq_code.mst, 고정 길이)
+- 미국: NASDAQ·NYSE·AMEX (nasmst.cod / nysmst.cod / amsmst.cod, 탭 구분)
 주소와 파일 형식은 공식 예제(koreainvestment/open-trading-api 의 stocks_info)와 같습니다.
 받지 못하면 내장 목록과 검색 기록에 남은 이름으로 검색합니다. SYMBOL_DOWNLOAD=off 이면 받지 않습니다.
 """
@@ -21,26 +23,26 @@ from pathlib import Path
 
 import httpx
 
+from .codes import DOMESTIC_RE, EXCHANGES, OVERSEAS_RE, is_overseas, normalize, ticker
+
 log = logging.getLogger("symbols")
 
-MASTER_URL = "https://new.real.download.dws.co.kr/common/master/{name}_code.mst.zip"
-# 각 줄 끝의 고정 길이 필드 글자 수 (공식 예제 field_specs 의 합: KOSPI 227, KOSDAQ 221)
-MASTERS = {"kospi": ("KOSPI", 227), "kosdaq": ("KOSDAQ", 221)}
+MASTER_BASE = "https://new.real.download.dws.co.kr/common/master/"
 MAX_ZIP_BYTES = 10 * 1024 * 1024   # 내려받는 zip 크기 상한
 MAX_MST_BYTES = 30 * 1024 * 1024   # 압축을 푼 마스터 파일 크기 상한 (압축 폭탄 방지)
-MIN_ROWS = 100                     # 이보다 적게 읽히면 형식이 바뀐 것으로 보고 기존 목록을 유지합니다
+MIN_ROWS = 100                     # 이보다 적게 읽히면 형식이 바뀐 것으로 보고 그 시장은 이전 목록을 유지합니다
 REFRESH_SEC = 12 * 3600
 RETRY_SEC = 10 * 60
 NAME_MAX = 40
 
-CODE_RE = re.compile(r"^[0-9A-Z]{6}$")
-QUERY_CODE_RE = re.compile(r"^[0-9A-Z]{1,6}$")
-# 그룹코드 -> 표시 이름. ELW·신주인수권 등은 검색 목록에서 뺍니다.
+# 국내 그룹코드 -> 표시 이름. ELW·신주인수권 등은 검색 목록에서 뺍니다.
 KINDS = {"ST": "주식", "EF": "ETF", "FE": "ETF", "EN": "ETN", "RT": "리츠", "MF": "투자회사", "IF": "인프라",
          "DR": "DR", "FS": "외국주", "BC": "수익증권", "SC": "선박"}
+# 해외 Security type: 2 주식, 3 ETP (1 지수, 4 워런트는 뺍니다)
+OVERSEAS_KINDS = {"2": "주식", "3": "ETF"}
 KIND_ORDER = {"주식": 0, "ETF": 1}
 
-# 마스터를 받기 전이거나 받지 못했을 때 쓰는 목록
+# 마스터를 받기 전이거나 받지 못했을 때 쓰는 목록 (코드, 이름, 시장, 종류, 규모, 영문명)
 BUILTIN = [
     ("005930", "삼성전자", "KOSPI", "주식"), ("000660", "SK하이닉스", "KOSPI", "주식"),
     ("373220", "LG에너지솔루션", "KOSPI", "주식"), ("207940", "삼성바이오로직스", "KOSPI", "주식"),
@@ -50,9 +52,18 @@ BUILTIN = [
     ("105560", "KB금융", "KOSPI", "주식"), ("006400", "삼성SDI", "KOSPI", "주식"),
     ("051910", "LG화학", "KOSPI", "주식"), ("012450", "한화에어로스페이스", "KOSPI", "주식"),
     ("069500", "KODEX 200", "KOSPI", "ETF"), ("122630", "KODEX 레버리지", "KOSPI", "ETF"),
+    ("NAS:AAPL", "애플", "NASDAQ", "주식", 9, "APPLE INC"),
+    ("NAS:MSFT", "마이크로소프트", "NASDAQ", "주식", 9, "MICROSOFT CORP"),
+    ("NAS:NVDA", "엔비디아", "NASDAQ", "주식", 9, "NVIDIA CORP"),
+    ("NAS:TSLA", "테슬라", "NASDAQ", "주식", 9, "TESLA INC"),
+    ("NAS:AMZN", "아마존닷컴", "NASDAQ", "주식", 9, "AMAZON.COM INC"),
+    ("NAS:GOOGL", "알파벳 A", "NASDAQ", "주식", 9, "ALPHABET INC"),
+    ("NAS:META", "메타 플랫폼스", "NASDAQ", "주식", 9, "META PLATFORMS INC"),
+    ("NAS:QQQ", "인베스코 QQQ", "NASDAQ", "ETF", 9, "INVESCO QQQ TRUST"),
+    ("AMS:SPY", "SPDR S&P 500", "AMEX", "ETF", 9, "SPDR S&P 500 ETF TRUST"),
+    ("NYS:KO", "코카콜라", "NYSE", "주식", 9, "COCA-COLA CO"),
 ]
-
-POPULAR = frozenset(code for code, *_ in BUILTIN)  # 같은 수준으로 맞는 종목끼리는 이 종목들을 먼저 보여 줍니다
+POPULAR = frozenset(row[0] for row in BUILTIN)  # 같은 수준으로 맞는 종목끼리는 이 종목들을 먼저 보여 줍니다
 
 CHOSUNG = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
 _CHOSUNG_SET = set(CHOSUNG)
@@ -85,20 +96,28 @@ class Symbol:
     name: str
     market: str
     kind: str
-    key: str = field(repr=False, compare=False)
+    names: tuple = field(repr=False, compare=False)  # 검색용으로 정리한 이름들 (한글명, 영문명)
+    ticker_key: str = field(repr=False, compare=False)  # 검색용 코드·티커
     initials: str = field(repr=False, compare=False)
     size: int = field(default=9, repr=False, compare=False)  # 시가총액 규모 1 대형 · 2 중형 · 3 소형 · 9 모름
+    english: str = field(default="", repr=False, compare=False)
 
     @classmethod
-    def make(cls, code: str, name: str, market: str = "", kind: str = "", size: int = 9) -> "Symbol":
-        return cls(code, name, market, kind, _key(name), _initials(name), size)
+    def make(cls, code: str, name: str, market: str = "", kind: str = "", size: int = 9,
+             english: str = "") -> "Symbol":
+        names = tuple(k for k in (_key(name), _key(english)) if k)
+        return cls(code, name, market, kind, names, ticker(code).casefold(), _initials(name), size, english)
+
+    def row(self) -> tuple:
+        return (self.code, self.name, self.market, self.kind, self.size, self.english)
 
     def as_dict(self) -> dict:
-        return {"code": self.code, "name": self.name, "market": self.market, "kind": self.kind}
+        return {"code": self.code, "symbol": ticker(self.code), "name": self.name,
+                "market": self.market, "kind": self.kind}
 
 
-def parse_master(data: bytes, market: str, tail: int) -> list[tuple[str, str, str, str, int]]:
-    """KIS 종목 마스터(.mst, cp949 고정 길이)를 (코드, 이름, 시장, 종류, 규모) 목록으로 바꿉니다.
+def parse_master(data: bytes, market: str, tail: int) -> list[tuple]:
+    """국내 종목 마스터(.mst, cp949 고정 길이)를 (코드, 이름, 시장, 종류, 규모) 목록으로 바꿉니다.
 
     한 줄: 단축코드(9) + 표준코드(12) + 한글명(가변) + 고정 길이 필드(tail).
     고정 길이 필드는 그룹코드(2) + 시가총액 규모(1) 로 시작합니다.
@@ -114,17 +133,54 @@ def parse_master(data: bytes, market: str, tail: int) -> list[tuple[str, str, st
         kind = KINDS.get(fixed[:2])
         size = int(fixed[2]) if fixed[2] in "123" else 9
         name = clean_name(line[21:-tail])
-        if CODE_RE.match(code) and kind and name:
+        if DOMESTIC_RE.match(code) and kind and name:
             rows.append((code, name, market, kind, size))
     return rows
 
 
+def parse_overseas_master(data: bytes, excd: str) -> list[tuple]:
+    """미국 종목 마스터(.cod, cp949 탭 구분)를 (코드, 이름, 시장, 종류, 규모, 영문명) 목록으로 바꿉니다.
+
+    열: 국가, 거래소ID, 거래소코드, 거래소명, 심볼(4), 실시간심볼, 한글명(6), 영문명(7), 종류(8), ...
+    """
+    text = data.decode("cp949", errors="replace")
+    rows = []
+    for line in text.split("\n"):
+        cols = line.rstrip("\r").split("\t")
+        if len(cols) < 9:
+            continue
+        kind = OVERSEAS_KINDS.get(cols[8].strip())
+        code = f"{excd}:{cols[4].strip().upper()}"
+        english = clean_name(cols[7])
+        name = clean_name(cols[6]) or english
+        if kind and name and OVERSEAS_RE.match(code):
+            rows.append((code, name, EXCHANGES[excd], kind, 9, english))
+    return rows
+
+
+def _domestic(name: str, market: str, tail: int):
+    return name, market, f"{name}_code.mst.zip", f"{name}_code.mst", lambda data: parse_master(data, market, tail)
+
+
+def _overseas(name: str, excd: str):
+    return (name, EXCHANGES[excd], f"{name}mst.cod.zip", f"{name}mst.cod",
+            lambda data: parse_overseas_master(data, excd))
+
+
+# (이름, 시장, zip 파일, zip 안의 파일, 해석 함수). 고정 길이 글자 수는 공식 예제 field_specs 의 합입니다.
+SOURCES = [
+    _domestic("kospi", "KOSPI", 227), _domestic("kosdaq", "KOSDAQ", 221),
+    _overseas("nas", "NAS"), _overseas("nys", "NYS"), _overseas("ams", "AMS"),
+]
+
+
 def _unzip_master(blob: bytes, member: str) -> bytes:
     with zipfile.ZipFile(io.BytesIO(blob)) as zf:
-        infos = [i for i in zf.infolist() if not i.is_dir() and i.filename.lower().endswith(".mst")]
+        infos = [i for i in zf.infolist() if not i.is_dir()
+                 and i.filename.lower().endswith((".mst", ".cod"))]
         info = next((i for i in infos if i.filename.lower() == member), infos[0] if infos else None)
         if info is None:
-            raise ValueError("zip 안에 .mst 파일이 없습니다")
+            raise ValueError("zip 안에 마스터 파일이 없습니다")
         if info.file_size > MAX_MST_BYTES:
             raise ValueError("마스터 파일이 너무 큽니다")
         with zf.open(info) as f:
@@ -166,7 +222,7 @@ class SymbolBook:
 
     @property
     def ready(self) -> bool:
-        """전체 종목 마스터를 쓰고 있는지."""
+        """종목 마스터를 쓰고 있는지 (내장 목록만 쓰는 중이면 False)."""
         return self._master
 
     def _set(self, rows) -> None:
@@ -175,7 +231,8 @@ class SymbolBook:
             if code in by_code:
                 continue
             size = rest[0] if rest and rest[0] in (1, 2, 3) else 9
-            s = Symbol.make(code, name, market, kind, size)
+            english = rest[1] if len(rest) > 1 and isinstance(rest[1], str) else ""
+            s = Symbol.make(code, name, market, kind, size, english)
             items.append(s)
             by_code[code] = s
         self._items, self._by_code = items, by_code
@@ -184,9 +241,10 @@ class SymbolBook:
     def _load_cache(self) -> None:
         try:
             data = json.loads(self.cache_file.read_text(encoding="utf-8"))
-            rows = [(row[0], clean_name(row[1]), str(row[2]), str(row[3]), *row[4:5]) for row in data["items"]
-                    if isinstance(row, list) and len(row) >= 4
-                    and isinstance(row[0], str) and CODE_RE.match(row[0]) and isinstance(row[1], str)]
+            rows = [(row[0], clean_name(row[1]), str(row[2]), str(row[3]), *row[4:5],
+                     *(clean_name(x) for x in row[5:6])) for row in data["items"]
+                    if isinstance(row, list) and len(row) >= 4 and normalize(row[0]) == row[0]
+                    and isinstance(row[1], str)]
             fetched_at = float(data["fetched_at"])
         except (OSError, ValueError, KeyError, TypeError):
             return
@@ -216,27 +274,41 @@ class SymbolBook:
         self._task = asyncio.create_task(self._refresh())
 
     async def _refresh(self) -> None:
+        rows, failed = [], []
         try:
-            rows = []
             async with httpx.AsyncClient(timeout=20.0, verify=True, follow_redirects=False,
                                          transport=self._transport) as client:
-                for name, (market, tail) in MASTERS.items():
-                    blob = await _fetch(client, MASTER_URL.format(name=name))
-                    part = parse_master(_unzip_master(blob, f"{name}_code.mst"), market, tail)
-                    if len(part) < MIN_ROWS:
-                        raise ValueError(f"{name} 마스터에서 종목을 {len(part)}개만 읽었습니다")
+                for name, market, zip_name, member, parse in SOURCES:
+                    try:
+                        part = parse(_unzip_master(await _fetch(client, MASTER_BASE + zip_name), member))
+                        if len(part) < MIN_ROWS:
+                            raise ValueError(f"종목을 {len(part)}개만 읽었습니다")
+                    except Exception as e:
+                        failed.append(name)
+                        log.warning("%s 종목 마스터를 받지 못했습니다 (%s: %s)", name, type(e).__name__,
+                                    clean_name(e)[:200])
+                        # 그 시장은 지금 쓰는 목록(전에 받은 마스터, 없으면 내장 목록)을 계속 씁니다
+                        part = [s.row() for s in self._items if s.market == market]
                     rows += part
-            self._set(rows)
-            self._master, self._fetched_at = True, time.time()
-            try:
-                self._save_cache(rows)
-            except OSError as e:
-                log.warning("종목 목록 캐시를 저장하지 못했습니다 (%s)", type(e).__name__)
-            log.info("종목 마스터 %d개를 받았습니다", len(rows))
-        except Exception as e:
-            self._failed_at = time.time()
-            log.warning("종목 마스터를 받지 못했습니다 (%s: %s), 내장 목록으로 검색합니다",
-                        type(e).__name__, clean_name(e)[:200])
+        except Exception as e:  # 연결 자체를 만들지 못한 경우
+            failed = [s[0] for s in SOURCES]
+            log.warning("종목 마스터를 받지 못했습니다 (%s)", type(e).__name__)
+        now = time.time()
+        if len(failed) == len(SOURCES) or len(rows) < MIN_ROWS:
+            self._failed_at = now
+            log.warning("종목 마스터를 받지 못해 내장 목록으로 검색합니다")
+            return
+        self._set(rows)
+        self._master = True
+        if failed:
+            self._failed_at = now  # 일부 시장만 받았으면 잠시 뒤 다시 시도합니다
+        else:
+            self._fetched_at = now
+        try:
+            self._save_cache(rows)
+        except OSError as e:
+            log.warning("종목 목록 캐시를 저장하지 못했습니다 (%s)", type(e).__name__)
+        log.info("종목 마스터 %d개를 받았습니다%s", len(rows), f" (실패: {', '.join(failed)})" if failed else "")
 
     async def wait_ready(self, timeout: float) -> None:
         """처음 받는 중이면 잠시 기다립니다 (이미 목록이 있으면 바로 돌아갑니다)."""
@@ -256,29 +328,30 @@ class SymbolBook:
     def remember(self, code: str, name: str) -> None:
         """목록에 없는 종목의 이름을 기억해 둡니다 (마스터를 못 받았을 때 검색 기록의 이름)."""
         name = clean_name(name)
-        if CODE_RE.match(code) and name and code not in self._by_code:
+        if normalize(code) == code and name and code not in self._by_code:
             self._known[code] = Symbol.make(code, name)
 
     def get(self, code: str) -> Symbol | None:
         return self._by_code.get(code) or self._known.get(code)
 
     def search(self, query: str, limit: int = 20, prefer=frozenset()) -> list[Symbol]:
-        """맞는 정도(이름 전체 > 앞부분 > 코드 > 이름 중간 > 초성)로 먼저 나누고, 같은 수준에서는
-        검색 기록(prefer) > 주요 종목 > 주식 > 시가총액 규모 > 짧은 이름 순서로 보여 줍니다."""
+        """맞는 정도(이름·코드·티커 전체 > 이름 앞부분 > 코드·티커 앞부분 > 이름 중간 > 초성)로 먼저 나누고,
+        같은 수준에서는 검색 기록(prefer) > 주요 종목 > 주식 > 시가총액 규모 > 짧은 이름 순서로 보여 줍니다."""
         q = _key(clean_name(query))
         if not q:
             return []
-        q_code = q.upper() if QUERY_CODE_RE.match(q.upper()) else ""
+        if q.count(":") == 1 and normalize(q) and is_overseas(q.upper()):
+            q = q.split(":", 1)[1]  # 'nas:aapl' 처럼 거래소를 붙여 입력한 경우
         q_initials = q if any(ch in _CHOSUNG_SET for ch in q) and not any("가" <= ch <= "힣" for ch in q) else ""
         scored = []
         for s in [*self._items, *(k for c, k in self._known.items() if c not in self._by_code)]:
-            if (q_code and s.code == q_code) or s.key == q:
+            if s.ticker_key == q or q in s.names:
                 rank = 0
-            elif s.key.startswith(q):
+            elif any(n.startswith(q) for n in s.names):
                 rank = 1
-            elif q_code and s.code.startswith(q_code):
+            elif s.ticker_key.startswith(q):
                 rank = 2
-            elif q in s.key:
+            elif any(q in n for n in s.names):
                 rank = 3
             elif q_initials and s.initials.startswith(q_initials):
                 rank = 4
