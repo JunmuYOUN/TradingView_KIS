@@ -61,6 +61,8 @@ Android 앱은 기기 안에서 같은 서버와 차트 화면을 실행합니�
 .\android\build-android.ps1 -NoInstall
 ```
 
+`android/` 폴더는 비공개 저장소(`TradingView_KIS_android`)를 가리키는 서브모듈입니다. 그 저장소를 볼 권한이 있으면 `git clone --recurse-submodules`로 함께 받거나, 이미 받은 폴더에서 `git submodule update --init`을 실행하세요. 권한이 없으면 `android/`는 빈 폴더로 남고 Windows 앱과 브라우저 실행은 그대로 쓸 수 있습니다.
+
 ## KIS 키 연결
 
 1. [KIS Developers](https://apiportal.koreainvestment.com)에서 API를 신청하고 App Key와 App Secret을 발급받습니다. 모의투자 키로도 시세를 받을 수 있습니다.
