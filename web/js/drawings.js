@@ -11,11 +11,31 @@ export const TOOLS = {
   trend: { label: '추세선', key: 't', points: 2, color: '#2962ff' },
   ray: { label: '연장선', key: 'r', points: 2, color: '#2962ff' },
   hline: { label: '수평선', key: 'h', points: 1, color: '#f7a600' },
+  vline: { label: '수직선', points: 1, color: '#64b5f6' },
+  arrow: { label: '화살표', points: 2, color: '#ffb74d' },
+  rectangle: { label: '사각형', points: 2, color: '#26a69a' },
+  ellipse: { label: '타원', points: 2, color: '#ab82ed' },
+  triangle: { label: '삼각형', points: 3, color: '#59a3ed' },
   fib: { label: '피보나치', key: 'f', points: 2, color: '#787b86' },
   channel: { label: '평행 채널', key: 'c', points: 3, color: '#2962ff' },
   elliott5: { label: '충격파 12345', key: 'e', points: 6, color: '#3179f5' },
   elliottABC: { label: '조정파 ABC', key: 'a', points: 4, color: '#e91e63' },
+  range: { label: '가격 범위', points: 2, color: '#26a69a' },
+  brush: { label: '브러시', key: 'b', color: '#d6d9e0' },
+  text: { label: '텍스트', points: 1, color: '#d6d9e0' },
+  marker: { label: '아이콘', points: 1, color: '#ffc758' },
+  ruler: { label: '측정', points: 2, color: '#72adff', temporary: true },
+  zoom: { label: '구간 확대', points: 2, color: '#72adff', temporary: true },
 };
+
+const STYLE_KEY = 'kis.drawingStyles.v1';
+const DASHES = { solid: [], dashed: [8, 5], dotted: [2, 4] };
+function readStyles() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STYLE_KEY));
+    return saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+  } catch { return {}; }
+}
 
 export const FIB_LEVELS = [
   { r: 0, c: '#787b86' },
@@ -39,6 +59,17 @@ export function setPriceDecimals(n) {
 }
 const fmtPrice = (p) => p.toLocaleString('ko-KR', { minimumFractionDigits: priceDecimals, maximumFractionDigits: priceDecimals });
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+
+function isAlertLine(d) {
+  return d?.type === 'hline' || d?.type === 'trend' || d?.type === 'ray';
+}
+
+function hasAlertGeometry(d) {
+  if (!isAlertLine(d)) return false;
+  const [a, b] = d.points || [];
+  if (!Number.isFinite(a?.price) || !Number.isFinite(a.time)) return false;
+  return d.type === 'hline' || (Number.isFinite(b?.price) && Number.isFinite(b.time) && a.time !== b.time);
+}
 
 function hexToRgba(hex, a) {
   const h = hex.replace('#', '');
@@ -125,7 +156,15 @@ export class DrawingManager {
 
     this.drawings = [];
     this.tool = 'cursor';
+    this.activePreset = null;
     this.magnet = true;
+    this.defaults = readStyles();
+    this.locked = false;
+    this.hidden = false;
+    this.repeat = false;
+    this.measurement = null;
+    this.brushing = false;
+    this.metrics = document.createElement('canvas').getContext('2d');
     this.draft = null;      // { type, points: [...], hover }
     this.selectedId = null;
     this.hoverId = null;
@@ -136,6 +175,8 @@ export class DrawingManager {
     this.onChange = () => {};     // 선이 바뀌었을 때 (저장용)
     this.onSelect = () => {};     // 선택이 바뀌었을 때 (스타일 패널용)
     this.onToolChange = () => {};
+    this.onPresetStyleChange = () => {};
+    this.onAlertTargetChange = () => {};
 
     this._requestUpdate = null;
     this.primitive = new DrawingPrimitive(this);
@@ -150,11 +191,27 @@ export class DrawingManager {
 
   load(drawings) {
     this.drawings = Array.isArray(drawings) ? drawings : [];
+    const ids = new Set();
+    let repaired = false;
+    for (const drawing of this.drawings) {
+      if (!drawing.id || ids.has(drawing.id)) {
+        drawing.id = uid();
+        repaired = true;
+      }
+      ids.add(drawing.id);
+    }
     this.selectedId = null;
     this.draft = null;
+    this.measurement = null;
+    this.drag = null;
+    this.brushing = false;
     this.history = [];
     this.onSelect(null);
     this.update();
+    for (const drawing of this.drawings) {
+      if (isAlertLine(drawing)) this.onAlertTargetChange(drawing.id, 'change');
+    }
+    if (repaired) this.onChange();
   }
 
   toJSON() {
@@ -167,21 +224,36 @@ export class DrawingManager {
   }
 
   undo() {
+    if (this.locked || this.hidden) return;
     const s = this.history.pop();
     if (s === undefined) return;
+    const previous = this.drawings;
     this.drawings = JSON.parse(s);
+    const restored = new Map(this.drawings.map(d => [d.id, d]));
+    for (const drawing of previous) {
+      if (!isAlertLine(drawing)) continue;
+      const next = restored.get(drawing.id);
+      if (!next) this.onAlertTargetChange(drawing.id, 'remove');
+      else if (JSON.stringify(drawing.points) !== JSON.stringify(next.points)) this.onAlertTargetChange(drawing.id, 'change');
+    }
     if (!this.drawings.find((d) => d.id === this.selectedId)) {
       this.selectedId = null;
-      this.onSelect(null);
     }
+    this.onSelect(this.selected);
     this.update();
     this.onChange();
   }
 
-  setTool(tool) {
+  setTool(tool, preset = null) {
     if (!TOOLS[tool]) return;
+    if ((this.locked || this.hidden) && tool !== 'cursor' && !TOOLS[tool].temporary) return;
     this.tool = tool;
+    this.activePreset = preset;
     this.draft = null;
+    this.brushing = false;
+    this.measurement = null;
+    this.hoverId = null;
+    this.select(null);
     this.container.style.cursor = tool === 'cursor' ? '' : 'crosshair';
     this.onToolChange(tool);
     this.update();
@@ -195,6 +267,31 @@ export class DrawingManager {
     return this.drawings.find((d) => d.id === this.selectedId) || null;
   }
 
+  alertTarget(id = this.selectedId) {
+    const drawing = this.drawings.find(d => d.id === id);
+    if (!hasAlertGeometry(drawing)) return null;
+    const [a, b] = drawing.points;
+    const date = new Date(a.time * 1000).toISOString().slice(0, a.time % 86400 === 0 ? 10 : 16).replace('T', ' ');
+    const prices = drawing.type === 'hline' ? fmtPrice(a.price) : fmtPrice(a.price) + ' → ' + fmtPrice(b.price);
+    const name = drawing.toolName || TOOLS[drawing.type].label;
+    return { id, label: name + ' (' + date + ', ' + prices + ')' };
+  }
+
+  alertValue(id, time) {
+    const drawing = this.drawings.find(d => d.id === id);
+    if (!hasAlertGeometry(drawing) || !Number.isFinite(time) || (this.drag?.id === id && this.drag.moved)) return null;
+    const [a, b] = drawing.points;
+    if (drawing.type === 'hline') return a.price;
+    if (!this.timeMap.length) return null;
+    // The canvas draws straight lines in bar coordinates; weekends and session gaps take no extra width.
+    const start = this.timeMap.toLogical(a.time);
+    const width = this.timeMap.toLogical(b.time) - start;
+    if (!width) return null;
+    const fraction = (this.timeMap.toLogical(time) - start) / width;
+    if (fraction < 0 || (drawing.type === 'trend' && fraction > 1)) return null;
+    return a.price + (b.price - a.price) * fraction;
+  }
+
   select(id) {
     this.selectedId = id;
     this.onSelect(this.selected);
@@ -202,28 +299,44 @@ export class DrawingManager {
   }
 
   deleteSelected() {
-    if (!this.selectedId) return;
+    if (!this.selectedId || this.locked || this.hidden) return;
     this._snapshot();
+    const removed = this.selected;
     this.drawings = this.drawings.filter((d) => d.id !== this.selectedId);
     this.select(null);
+    if (isAlertLine(removed)) this.onAlertTargetChange(removed.id, 'remove');
     this.onChange();
   }
 
   clearAll() {
-    if (!this.drawings.length) return;
+    if (!this.drawings.length || this.locked || this.hidden) return;
     this._snapshot();
+    const removed = this.drawings;
     this.drawings = [];
     this.select(null);
+    for (const drawing of removed) {
+      if (isAlertLine(drawing)) this.onAlertTargetChange(drawing.id, 'remove');
+    }
     this.onChange();
   }
 
-  setSelectedStyle(patch) {
-    const d = this.selected;
-    if (!d) return;
-    this._snapshot();
-    d.style = { ...d.style, ...patch };
+  toolStyle(type, preset = this.activePreset) {
+    const style = preset?.type === type ? preset.style : this.defaults[type];
+    return { color: TOOLS[type].color, width: 1.5, dash: 'solid', ...style };
+  }
+
+  changeStyle(patch) {
+    if (this.selected) {
+      this._snapshot();
+      this.selected.style = { ...this.selected.style, ...patch };
+      this.onChange();
+    } else if (this.activePreset) {
+      this.onPresetStyleChange(this.activePreset, patch);
+    } else if (this.tool !== 'cursor' && !TOOLS[this.tool].temporary) {
+      this.defaults[this.tool] = { ...this.defaults[this.tool], ...patch };
+      try { localStorage.setItem(STYLE_KEY, JSON.stringify(this.defaults)); } catch { /* 이번 실행에는 적용 */ }
+    }
     this.update();
-    this.onChange();
   }
 
   // ------------------------------------------------------------ 좌표 변환
@@ -231,7 +344,7 @@ export class DrawingManager {
     const ts = this.chart.timeScale();
     return {
       width: ts.width(),
-      height: this.container.clientHeight - ts.height(),
+      height: this.chart.panes()[0].getHeight(),
     };
   }
 
@@ -243,7 +356,7 @@ export class DrawingManager {
   }
 
   /** 화면 좌표 -> { time, price }. 봉 중앙에 맞추고, 자석 모드면 OHLC 에 붙입니다. */
-  fromPx(x, y, useMagnet = this.magnet) {
+  fromPx(x, y, useMagnet = this.magnet, freehand = false) {
     const lg = this.chart.timeScale().coordinateToLogical(x);
     let price = this.series.coordinateToPrice(y);
     if (lg === null || price === null) return null;
@@ -262,7 +375,7 @@ export class DrawingManager {
         if (bestD < 40) price = best;
       }
     }
-    return { time: this.timeMap.toTime(li), price };
+    return { time: this.timeMap.toTime(freehand ? lg : li), price };
   }
 
   _localXY(ev) {
@@ -279,15 +392,49 @@ export class DrawingManager {
     const px = points.map((p) => this.toPx(p));
     if (px.some((p) => p === null)) return null;
     const color = (d.style && d.style.color) || TOOLS[d.type].color;
-    const lw = (d.style && d.style.width) || 1.5;
+    const lw = d.style?.width || 1.5;
     const g = { lines: [], fills: [], labels: [], anchors: px, color, lw };
-    const line = (a, b, extra = {}) => g.lines.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, color, width: lw, ...extra });
+    const dash = DASHES[d.style?.dash] || [];
+    const line = (a, b, extra = {}) => g.lines.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, color, width: lw, dash, ...extra });
 
     switch (d.type) {
       case 'trend':
         if (px.length >= 2) line(px[0], px[1]);
         break;
 
+      case 'vline':
+        line({ x: px[0].x, y: 0 }, { x: px[0].x, y: H });
+        break;
+
+      case 'arrow': {
+        if (px.length < 2) break;
+        const [a, b] = px;
+        line(a, b);
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const angle = Math.atan2(dy, dx);
+        const head = Math.min(9 + lw, Math.hypot(dx, dy) / 2);
+        for (const side of [-0.52, 0.52]) {
+          line(b, { x: b.x - head * Math.cos(angle + side), y: b.y - head * Math.sin(angle + side) }, { dash: [] });
+        }
+        break;
+      }
+      case 'triangle':
+        if (px.length >= 2) line(px[0], px[1]);
+        if (px.length === 3) {
+          line(px[1], px[2]);
+          line(px[2], px[0]);
+          g.fills.push({ pts: px.map(p => [p.x, p.y]), color: hexToRgba(color, 0.12) });
+        }
+        break;
+      case 'ellipse': {
+        if (px.length < 2) break;
+        const [a, b] = px;
+        if (a.x === b.x || a.y === b.y) { line(a, b); break; }
+        g.ellipse = new Path2D();
+        g.ellipse.ellipse((a.x + b.x) / 2, (a.y + b.y) / 2, Math.abs(a.x - b.x) / 2,
+          Math.abs(a.y - b.y) / 2, 0, 0, 2 * Math.PI);
+        break;
+      }
       case 'ray':
         if (px.length >= 2) {
           const [ex, ey] = extendToEdge(px[0].x, px[0].y, px[1].x, px[1].y, W, H);
@@ -297,7 +444,7 @@ export class DrawingManager {
 
       case 'hline': {
         const y = px[0].y;
-        g.lines.push({ x1: 0, y1: y, x2: W, y2: y, color, width: lw });
+        line({ x: 0, y }, { x: W, y });
         g.labels.push({ x: W - 6, y: y - 4, text: fmtPrice(points[0].price), color, align: 'right' });
         break;
       }
@@ -312,17 +459,18 @@ export class DrawingManager {
           const price = b.price + (a.price - b.price) * lv.r;
           const y = this.series.priceToCoordinate(price);
           if (y === null) continue;
-          ys.push({ y, lv, price });
-          g.lines.push({ x1: xL, y1: y, x2: xR, y2: y, color: lv.c, width: 1 });
-          g.labels.push({ x: xL + 4, y: y - 3, text: `${lv.r} (${fmtPrice(price)})`, color: lv.c, align: 'left' });
+          const levelColor = color === TOOLS.fib.color ? lv.c : color;
+          ys.push({ y, color: levelColor });
+          line({ x: xL, y }, { x: xR, y }, { color: levelColor });
+          g.labels.push({ x: xL + 4, y: y - 3, text: `${lv.r} (${fmtPrice(price)})`, color: levelColor, align: 'left' });
         }
         for (let i = 0; i + 1 < ys.length; i += 1) {
           g.fills.push({
             pts: [[xL, ys[i].y], [xR, ys[i].y], [xR, ys[i + 1].y], [xL, ys[i + 1].y]],
-            color: hexToRgba(ys[i + 1].lv.c, 0.07),
+            color: hexToRgba(ys[i + 1].color, 0.07),
           });
         }
-        line(px[0], px[1], { dash: [4, 4], width: 1 });
+        line(px[0], px[1], { dash: [4, 4] });
         break;
       }
 
@@ -371,6 +519,36 @@ export class DrawingManager {
         }
         break;
       }
+      case 'brush':
+        for (let i = 1; i < px.length; i++) line(px[i - 1], px[i]);
+        break;
+      case 'text':
+      case 'marker': {
+        const text = d.type === 'text' ? (d.style?.text || '메모') : (d.style?.glyph || '☺');
+        const size = d.style?.fontSize || (d.type === 'text' ? 16 : 24);
+        g.labels.push({ ...px[0], text, size, color });
+        this.metrics.font = `${size}px "Segoe UI", "Malgun Gothic", sans-serif`;
+        g.labelBox = { x: px[0].x, y: px[0].y - size, w: this.metrics.measureText(text).width, h: size + 4 };
+        break;
+      }
+      case 'rectangle':
+      case 'range':
+      case 'ruler':
+      case 'zoom': {
+        if (px.length < 2) break;
+        const [a,b] = px;
+        const corners = [a, { x: b.x, y: a.y }, b, { x: a.x, y: b.y }];
+        for (let i = 0; i < 4; i++) line(corners[i], corners[(i + 1) % 4]);
+        g.fills.push({ pts: corners.map(p => [p.x, p.y]), color: hexToRgba(color, 0.12) });
+        if (d.type === 'range' || d.type === 'ruler') {
+          const delta = points[1].price - points[0].price;
+          const pct = points[0].price ? ' (' + (100 * delta / points[0].price).toFixed(2) + '%)' : '';
+          const bars = Math.round(Math.abs(this.timeMap.toLogical(points[1].time) - this.timeMap.toLogical(points[0].time)));
+          g.labels.push({ x: Math.min(a.x,b.x) + 3, y: Math.min(a.y,b.y) - 5,
+            text: `${delta > 0 ? '+' : ''}${fmtPrice(delta)}${pct} · ${bars}봉`, color });
+        }
+        break;
+      }
       default:
         break;
     }
@@ -380,15 +558,24 @@ export class DrawingManager {
   // ------------------------------------------------------------ 렌더링
   render(ctx, mediaSize) {
     this.size = mediaSize;
-    const items = this.drawings.map((d) => ({ d, sel: d.id === this.selectedId, hov: d.id === this.hoverId }));
+    const items = this.hidden ? [] : this.drawings.map((d) => ({ d, sel: d.id === this.selectedId, hov: d.id === this.hoverId }));
+    if (this.measurement) items.push({ d: this.measurement });
     if (this.draft) {
       const pts = this.draft.hover ? [...this.draft.points, this.draft.hover] : this.draft.points;
-      if (pts.length) items.push({ d: { ...this.draft, points: pts, style: {} }, sel: true, hov: false, draft: true });
+      if (pts.length) items.push({ d: { ...this.draft, points: pts, style: this.toolStyle(this.tool) }, sel: true });
     }
     for (const it of items) {
       const g = this.geometry(it.d);
       if (!g) continue;
       ctx.save();
+      if (g.ellipse) {
+        ctx.fillStyle = hexToRgba(g.color, 0.12);
+        ctx.fill(g.ellipse);
+        ctx.strokeStyle = g.color;
+        ctx.lineWidth = g.lw + (it.hov ? 1 : 0);
+        ctx.setLineDash(DASHES[it.d.style?.dash] || []);
+        ctx.stroke(g.ellipse);
+      }
       for (const f of g.fills) {
         ctx.fillStyle = f.color;
         ctx.beginPath();
@@ -407,7 +594,7 @@ export class DrawingManager {
       }
       ctx.setLineDash([]);
       for (const t of g.labels) {
-        ctx.font = `${t.bold ? '600 ' : ''}11px -apple-system, "Segoe UI", "Malgun Gothic", sans-serif`;
+        ctx.font = `${t.bold ? '600 ' : ''}${t.size || 11}px "Segoe UI", "Malgun Gothic", sans-serif`;
         ctx.textAlign = t.align || 'left';
         ctx.lineWidth = 3;
         ctx.strokeStyle = 'rgba(19,23,34,0.85)'; // 캔들 위에서도 읽히도록 배경색 테두리
@@ -416,7 +603,8 @@ export class DrawingManager {
         ctx.fillText(t.text, t.x, t.y);
       }
       if (it.sel) {
-        for (const a of g.anchors) {
+        const anchors = it.d.type === 'brush' ? [g.anchors[0]] : g.anchors;
+        for (const a of anchors) {
           ctx.beginPath();
           ctx.arc(a.x, a.y, ANCHOR_R, 0, Math.PI * 2);
           ctx.fillStyle = '#131722';
@@ -432,6 +620,7 @@ export class DrawingManager {
 
   // ------------------------------------------------------------ 클릭 판정
   hitTest(x, y) {
+    if (this.hidden || this.locked) return null;
     if (!this.size.width) this.size = this._paneSize();
     // 선택된 선을 먼저, 나중에 그린 선을 먼저 검사합니다
     const order = [...this.drawings].reverse().sort((a, b) =>
@@ -439,9 +628,18 @@ export class DrawingManager {
     for (const d of order) {
       const g = this.geometry(d);
       if (!g) continue;
-      if (d.id === this.selectedId) {
+      if (g.labelBox) {
+        const box = g.labelBox;
+        if (x >= box.x - 3 && x <= box.x + box.w + 3 && y >= box.y - 3 && y <= box.y + box.h)
+          return { id: d.id, anchor: -1 };
+      }
+      if (d.id === this.selectedId && d.type !== 'brush') {
         const ai = g.anchors.findIndex((a) => Math.hypot(a.x - x, a.y - y) <= ANCHOR_R + 3);
         if (ai >= 0) return { id: d.id, anchor: ai };
+      }
+      if (g.ellipse) {
+        this.metrics.lineWidth = 2 * HIT_PX + g.lw;
+        if (this.metrics.isPointInStroke(g.ellipse, x, y)) return { id: d.id, anchor: -1 };
       }
       for (const l of g.lines) {
         if (distToSegment(x, y, l.x1, l.y1, l.x2, l.y2) <= HIT_PX) return { id: d.id, anchor: -1 };
@@ -463,12 +661,16 @@ export class DrawingManager {
     el.addEventListener('mousedown', (ev) => {
       if (ev.button !== 0) return;
       const { x, y } = this._localXY(ev);
-      if (!this._insidePane(x, y)) return;
+      if (!this._insidePane(x, y) || !this.timeMap.length) return;
+      if (this.measurement) { this.measurement = null; this.update(); }
 
       if (this.tool !== 'cursor') {
         ev.stopPropagation();
         ev.preventDefault();
-        this._addDraftPoint(x, y);
+        if (this.tool === 'brush') {
+          const pt = this.fromPx(x, y, false, true);
+          if (pt) { this.draft = { type: 'brush', points: [pt] }; this.brushing = true; }
+        } else this._addDraftPoint(x, y);
         return;
       }
 
@@ -497,6 +699,16 @@ export class DrawingManager {
     el.addEventListener('mousemove', (ev) => {
       if (this.drag) return;
       const { x, y } = this._localXY(ev);
+      if (this.brushing) {
+        const points = this.draft.points;
+        const last = this.toPx(points[points.length - 1]);
+        if (last && Math.hypot(x - last.x, y - last.y) >= 3 && this._insidePane(x, y)) {
+          const pt = this.fromPx(x, y, false, true);
+          if (pt && (pt.time !== points.at(-1).time || pt.price !== points.at(-1).price)) points.push(pt);
+          this.update();
+        }
+        return;
+      }
       if (this.draft) {
         const pt = this._inside(x, y) ? this.fromPx(x, y) : null;
         if (pt) {
@@ -543,14 +755,27 @@ export class DrawingManager {
     });
 
     window.addEventListener('mouseup', () => {
+      if (this.brushing) {
+        this.brushing = false;
+        if (this.draft.points.length > 1) this._finishDrawing();
+        else { this.draft = null; this.update(); }
+        return;
+      }
       if (!this.drag) return;
-      const moved = this.drag.moved;
+      const { id, moved } = this.drag;
       this.drag = null;
       this.container.style.cursor = '';
-      if (moved) this.onChange();
+      if (moved) {
+        if (isAlertLine(this.selected)) {
+          this.onAlertTargetChange(id, 'change');
+          this.onSelect(this.selected);
+        }
+        this.onChange();
+      }
     });
 
     window.addEventListener('keydown', (ev) => {
+      if (ev.defaultPrevented || document.querySelector('dialog[open]') || !this.container.getClientRects().length) return;
       const t = ev.target || {};
       const typing = t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable
         || (t.tagName === 'INPUT' && !['checkbox', 'radio', 'button', 'color'].includes(t.type));
@@ -589,16 +814,29 @@ export class DrawingManager {
     if (!this.draft) this.draft = { type: this.tool, points: [], hover: null };
     this.draft.points.push(pt);
     this.draft.hover = null;
-    if (this.draft.points.length >= spec.points) {
-      this._snapshot();
-      const d = { id: uid(), type: this.draft.type, points: this.draft.points, style: { color: spec.color, width: 1.5 } };
-      this.drawings.push(d);
-      this.draft = null;
+    if (this.draft.points.length >= spec.points) this._finishDrawing();
+    else this.update();
+  }
+
+  _finishDrawing() {
+    const { type, points } = this.draft;
+    const d = { id: uid(), type, points, style: this.toolStyle(type) };
+    if (this.activePreset) d.toolName = this.activePreset.name;
+    this.draft = null;
+    if (type === 'zoom') {
+      const [a, b] = points.map(p => this.timeMap.toLogical(p.time)).sort((x,y) => x - y);
+      if (b > a) this.chart.timeScale().setVisibleLogicalRange({ from: a, to: b });
       this.setTool('cursor');
-      this.select(d.id);
-      this.onChange();
-    } else {
+    } else if (type === 'ruler') {
+      this.setTool('cursor');
+      this.measurement = d;
       this.update();
+    } else {
+      this._snapshot();
+      this.drawings.push(d);
+      if (this.repeat) this.update();
+      else { this.setTool('cursor'); this.select(d.id); }
+      this.onChange();
     }
   }
 }

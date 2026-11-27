@@ -1,3 +1,7 @@
+param(
+    [string]$OutputDirectory = $PSScriptRoot,
+    [switch]$SkipAndroid  # build TradingView.exe only
+)
 $ErrorActionPreference = 'Stop'
 
 Push-Location -LiteralPath $PSScriptRoot
@@ -19,12 +23,24 @@ try {
     $buildDir = Join-Path $PSScriptRoot '.venv\desktop-build'
     # Keys and tokens never go into the bundle; the app stores them DPAPI-encrypted under data\ at run time.
     & $python -m PyInstaller --noconfirm --clean --onefile --windowed --name TradingView `
-        --distpath $PSScriptRoot --workpath $buildDir --specpath $buildDir `
+        --icon "$PSScriptRoot\web\mint-candles.ico" `
+        --distpath $OutputDirectory --workpath $buildDir --specpath $buildDir `
         --add-data "$PSScriptRoot\web:web" --collect-all webview `
+        --collect-data yfinance --collect-all curl_cffi --copy-metadata yfinance `
         --hidden-import uvicorn.loops.asyncio --hidden-import uvicorn.lifespan.on `
         --hidden-import uvicorn.protocols.http.h11_impl `
         --hidden-import uvicorn.protocols.websockets.websockets_impl desktop.py
     if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed.' }
 } finally {
     Pop-Location
+}
+
+# Android packages the same server/ and web/ code.
+$androidBuild = Join-Path $PSScriptRoot 'android\build-android.ps1'
+if (-not $SkipAndroid -and (Test-Path -LiteralPath $androidBuild)) {
+    try {
+        & $androidBuild
+    } catch {
+        Write-Warning "TradingView.exe was built, but the Android build failed: $_"
+    }
 }

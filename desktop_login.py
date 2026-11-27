@@ -3,59 +3,68 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import re
-import secrets
+from dataclasses import replace
 
 import httpx
-from dotenv import dotenv_values
 
-from server.config import ENV_FILE, Settings, load_settings, load_stored_connection, save_stored_connection
-from server.kis_source import KisError, KisSource
+from server.config import (
+    Settings, forget_connection, load_settings, load_stored_connection, migrate_plaintext_keys,
+    save_stored_connection,
+)
+from server.mock_source import MockSource
+from server.kis_source import KisCredentialError, KisError, KisSource
 
 
 log = logging.getLogger("desktop.login")
-ENVIRONMENTS = {"demo": "모의투자", "real": "실전투자"}
-MARKETS = {"J": "KRX", "UN": "KRX + NXT 통합", "NX": "NXT"}
-# .env 의 키 줄 (값만 지우고 줄과 주석은 남깁니다)
-SECRET_LINE = re.compile(rb"^([ \t]*(?:export[ \t]+)?KIS_APP_(?:KEY|SECRET)[ \t]*=)[^\r\n]*", re.M)
-
-
-def migrate_plaintext_keys() -> None:
-    """이전 버전이 .env 에 평문으로 저장한 키를 암호화 저장소로 옮기고 .env 에서는 지웁니다."""
-    if not ENV_FILE.exists():
-        return
-    values = dotenv_values(ENV_FILE, interpolate=False)
-    app_key = (values.get("KIS_APP_KEY") or "").strip()
-    app_secret = (values.get("KIS_APP_SECRET") or "").strip()
-    if not (app_key and app_secret):
-        return
-    save_stored_connection({"KIS_APP_KEY": app_key, "KIS_APP_SECRET": app_secret,
-                            "KIS_ENV": values.get("KIS_ENV") or "demo",
-                            "KIS_MARKET": values.get("KIS_MARKET") or "J"})
-    stored = load_stored_connection()
-    if not stored or (stored["KIS_APP_KEY"], stored["KIS_APP_SECRET"]) != (app_key, app_secret):
-        raise OSError("암호화한 키를 다시 읽지 못했습니다")  # 확인되기 전에는 .env 를 건드리지 않습니다
-    pending = ENV_FILE.with_name(f".env.{secrets.token_hex(4)}.tmp")
-    try:
-        pending.write_bytes(SECRET_LINE.sub(rb"\1", ENV_FILE.read_bytes()))
-        os.replace(pending, ENV_FILE)
-    finally:
-        pending.unlink(missing_ok=True)
-    log.info(".env 에 있던 평문 키를 암호화 저장소로 옮겼습니다")
 
 
 def load_desktop_settings() -> Settings:
-    try:
-        migrate_plaintext_keys()
-    except (OSError, ValueError) as exc:
-        log.warning(".env 의 평문 키를 암호화 저장소로 옮기지 못했습니다 (%s)", type(exc).__name__)
+    migrate_plaintext_keys()
     stored = load_stored_connection()
-    # 앱에서 연결한 키(암호화 저장소)가 .env·환경 변수보다 우선합니다
-    return load_settings({**stored, "DATA_SOURCE": "auto"} if stored else None)
+    overrides = {"DATA_SOURCE": "auto", **stored} if stored else {}
+    # 이전 로그인 창의 시장 대신 설정 탭에서 저장한 거래소를 사용합니다. 첫 기본값은 KRX입니다.
+    return load_settings({**overrides, "KIS_MARKET": "J"})
 
 
-async def connect_kis(state, app_key: str, app_secret: str, env: str, market: str) -> str:
+def load_startup_settings() -> Settings:
+    settings = load_desktop_settings()
+    if settings.source == "kis":
+        return replace(settings, source="mock")
+    return replace(settings, source="mock", app_key="", app_secret="")
+
+
+async def restore_desktop_session(state) -> str | None:
+    """Return None when connected, or the initial message for the startup login form."""
+    current = state.settings
+    if not current.app_key or not current.app_secret:
+        return ""
+    error = await connect_kis(state, current.app_key, current.app_secret, restore_saved=True)
+    return error or None
+
+
+async def logout_kis(state) -> str:
+    """End this app's KIS session, including credentials for automatic login."""
+    async with state.connection_lock:
+        previous = state.source
+        settings = replace(state.settings, source="mock", app_key="", app_secret="")
+        state.source, state.settings = MockSource(), settings
+        state.initial_settings = settings
+        symbols = getattr(state, "symbols", None)
+        if symbols is not None:
+            symbols.download = False
+            await symbols.close()
+        try:
+            await previous.close()
+        except Exception as exc:
+            log.warning("시세 연결 종료 실패 (%s)", type(exc).__name__)
+        try:
+            forget_connection()
+        except OSError:
+            return "현재 연결은 종료했습니다. 저장한 인증정보를 모두 지우지 못했습니다. 폴더 권한을 확인하고 로그아웃을 다시 누르세요."
+    return ""
+
+
+async def connect_kis(state, app_key: str, app_secret: str, *, restore_saved: bool = False) -> str:
     """Validate, save and activate a KIS connection, or return a message for the form."""
     app_key, app_secret = app_key.strip(), app_secret.strip()
     if not app_key and not app_secret:
@@ -64,56 +73,68 @@ async def connect_kis(state, app_key: str, app_secret: str, env: str, market: st
         return "App Key와 App Secret을 모두 입력하세요."
     if any(char.isspace() or ord(char) < 32 for char in app_key + app_secret):
         return "키에 공백이나 줄바꿈이 있는지 확인하세요."
-    if env not in ENVIRONMENTS or market not in MARKETS:
-        return "투자 환경과 시장을 선택하세요."
+    async with state.connection_lock:
+        first_env = state.settings.env
+        environments = (first_env,) if restore_saved else (first_env, "real" if first_env == "demo" else "demo")
+        for env in environments:
+            values = {"KIS_APP_KEY": app_key, "KIS_APP_SECRET": app_secret, "KIS_ENV": env,
+                      "KIS_MARKET": state.settings.market}
+            try:
+                settings = load_settings({**values, "DATA_SOURCE": "auto"})
+                source = KisSource(settings)
+            except OSError:
+                return "캐시 폴더에 쓸 수 없습니다. 실행 파일이 있는 폴더의 권한을 확인하세요."
+            previous = state.source
+            try:
+                # A cached token alone cannot tell us if the broker still accepts the keys.
+                # A single read-only quote also validates reused tokens without reissuing them.
+                await asyncio.wait_for(source.rest.verify_session(), timeout=6 if restore_saved else 20)
+                if not restore_saved:
+                    save_stored_connection(values)
+                state.settings, state.source, state.initial_settings = settings, source, settings
+                symbols = getattr(state, "symbols", None)
+                if symbols is not None:
+                    symbols.download = settings.symbol_download
+                    symbols.refresh_if_stale()
+                return ""
+            except KisCredentialError:
+                continue
+            except KisError as exc:
+                return f"한투 연결을 확인하지 못했습니다 ({exc.code}). 잠시 후 다시 시도하세요."
+            except (httpx.RequestError, TimeoutError, ValueError):
+                return "한투 서버에서 응답을 받지 못했습니다. 잠시 후 다시 시도하세요."
+            except OSError:
+                return "키를 암호화해 저장하지 못했습니다. 실행 파일이 있는 폴더의 권한을 확인하세요."
+            finally:
+                inactive = previous if state.source is source else source
+                try:
+                    await inactive.close()
+                except Exception as exc:
+                    log.warning("이전 데이터 연결 정리 실패 (%s)", type(exc).__name__)
+    return "한투 인증에 실패했습니다. App Key와 App Secret을 확인하세요."
 
-    values = {"KIS_APP_KEY": app_key, "KIS_APP_SECRET": app_secret, "KIS_ENV": env, "KIS_MARKET": market}
-    settings = load_settings({**values, "DATA_SOURCE": "auto"})
-    previous = state.source
-    try:
-        source = KisSource(settings)
-    except OSError:
-        return "캐시 폴더에 쓸 수 없습니다. 실행 파일이 있는 폴더의 권한을 확인하세요."
-    try:
-        await asyncio.wait_for(source.rest.auth.token(), timeout=20)
-        save_stored_connection(values)
-    except KisError:
-        return "한투 인증에 실패했습니다. 발급받은 키와 모의·실전 구분을 확인하세요."
-    except (httpx.RequestError, TimeoutError, ValueError):
-        return "한투 인증 서버에서 응답을 받지 못했습니다. 잠시 후 다시 시도하세요."
-    except OSError:
-        return "키를 암호화해 저장하지 못했습니다. 실행 파일이 있는 폴더의 권한을 확인하세요."
-    else:
-        state.settings, state.source = settings, source
-        return ""
-    finally:
-        inactive = previous if state.source is source else source
-        try:
-            await inactive.close()
-        except Exception as exc:
-            log.warning("이전 데이터 연결 정리 실패 (%s)", type(exc).__name__)
 
-
-def show_login(owner, state) -> bool:
+def show_login(owner, state, *, startup: bool = False, message: str = "") -> bool:
     from System import Action
 
     accepted = False
 
     def show() -> None:
         nonlocal accepted
-        accepted = _show_dialog(owner, state)
+        accepted = _show_dialog(owner, state, startup=startup, message=message)
 
     owner.Invoke(Action(show))
     return accepted
 
 
-def _show_dialog(owner, state) -> bool:
+def _show_dialog(owner, state, *, startup: bool = False, message: str = "") -> bool:
     from System.Drawing import Color, Point, Size
     from System.Windows import Forms as ui
 
     form = ui.Form()
-    form.Text = "한투 API 연결"
-    form.ClientSize = Size(478, 354)
+    form.Icon = owner.Icon
+    form.Text = "한투 API 로그인"
+    form.ClientSize = Size(478, 287)
     form.AutoScaleMode = ui.AutoScaleMode.Dpi
     form.FormBorderStyle = ui.FormBorderStyle.FixedDialog
     form.StartPosition = ui.FormStartPosition.CenterParent
@@ -137,48 +158,37 @@ def _show_dialog(owner, state) -> bool:
         control.UseSystemPasswordChar = secret
         return place(control, 24, y + 22, 430, 26)
 
-    def options(text: str, x: int, choices: dict[str, str], selected: str):
-        label(text, x, 191, 207)
-        control = ui.ComboBox()
-        control.DropDownStyle = ui.ComboBoxStyle.DropDownList
-        for choice in choices.values():
-            control.Items.Add(choice)
-        control.SelectedIndex = tuple(choices).index(selected)
-        return place(control, x, 213, 207, 28)
-
     label("KIS Developers에서 발급받은 키를 입력하세요.", 24, 22, 430)
     current = state.settings
     if current.app_key and current.app_secret:
-        hint = label("저장된 키를 사용하려면 두 입력칸을 비워 두세요.", 24, 46, 430)
-        hint.ForeColor = Color.DimGray
+        label("저장된 키로 다시 로그인하려면 두 입력칸을 비워 두세요.", 24, 46, 430).ForeColor = Color.DimGray
+    elif startup:
+        label("‘데모로 시작’을 누르면 예시 시세로 차트를 사용할 수 있습니다.", 24, 46, 430).ForeColor = Color.DimGray
 
-    key = field("App Key", 75)
+    key = field("App Key", 75, secret=True)
     secret = field("App Secret", 131, secret=True)
-    environment = options("투자 환경", 24, ENVIRONMENTS, current.env)
-    market = options("시장", 247, MARKETS, current.market)
-    status = label("키와 토큰은 이 Windows 계정에서만 풀 수 있게 암호화해 저장합니다.", 24, 255, 430, 44)
-    status.ForeColor = Color.DimGray
+    status = label(message or "키와 토큰은 이 Windows 계정에서만 풀 수 있게 암호화해 저장합니다.", 24, 192, 430, 42)
+    status.ForeColor = Color.Firebrick if message else Color.DimGray
     submit = ui.Button()
-    submit.Text = "연결"
+    submit.Text = "로그인"
     cancel = ui.Button()
-    cancel.Text = "취소"
+    cancel.Text = "데모로 시작" if startup else "취소"
     cancel.DialogResult = ui.DialogResult.Cancel
-    place(submit, 254, 306, 96, 30)
-    place(cancel, 358, 306, 96, 30)
+    place(submit, 234, 239, 96, 30)
+    place(cancel, 338, 239, 116, 30)
     form.AcceptButton, form.CancelButton = submit, cancel
 
     timer = ui.Timer()
     timer.Interval = 80
     pending = None
-    fields = (key, secret, environment, market, submit, cancel)
+    fields = (key, secret, submit, cancel)
 
     def submit_connection(_sender, _event) -> None:
         nonlocal pending
         if pending is not None:
             return
         pending = asyncio.run_coroutine_threadsafe(
-            connect_kis(state, key.Text, secret.Text, tuple(ENVIRONMENTS)[environment.SelectedIndex],
-                        tuple(MARKETS)[market.SelectedIndex]),
+            connect_kis(state, key.Text, secret.Text),
             state.event_loop,
         )
         for control in fields:

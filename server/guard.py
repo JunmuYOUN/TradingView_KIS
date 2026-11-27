@@ -3,7 +3,7 @@
 - Host 검사: DNS 리바인딩으로 다른 사이트가 127.0.0.1 서버에 붙는 것을 막습니다.
 - Origin / Sec-Fetch-Site 검사: 브라우저에 열린 다른 웹사이트가 실시간 웹소켓이나 API 를
   몰래 호출하는 것(Cross-Site WebSocket Hijacking, CSRF)을 막습니다.
-- 세션 쿠키(데스크톱 앱): 실행할 때마다 새로 만든 일회용 토큰으로 앱 창에만 쿠키를 주고,
+- 세션 쿠키: 실행할 때마다 새로 만든 일회용 토큰을 연 창에만 쿠키를 주고,
   쿠키가 없는 요청(같은 PC 의 다른 사용자·프로그램)은 거부합니다.
 """
 from __future__ import annotations
@@ -25,12 +25,19 @@ def _same(presented: str, expected: str) -> bool:
 
 
 class LocalGuard:
-    def __init__(self, app, *, host: str, port: int, require_session: bool = False) -> None:
+    def __init__(self, app, *, host: str, port: int, require_session: bool = True,
+                 public_host: str | None = None, https: bool = False) -> None:
         self.app = app
         if host in LOOPBACK_HOSTS:
-            self.hosts: set[str] | None = {f"{name}:{port}" for name in ("127.0.0.1", "localhost", "[::1]")}
+            names = {"127.0.0.1", "localhost", "[::1]"}
         else:
-            self.hosts = None  # 사용자가 외부 접속(HOST=0.0.0.0 등)을 연 경우에는 Host 를 고정하지 않습니다
+            if not require_session:
+                raise ValueError("외부 주소로 실행하려면 브라우저 세션 인증이 필요합니다.")
+            name = (public_host or host).lower()
+            names = {f"[{name}]" if ":" in name else name}
+        self.hosts = {f"{name}:{port}" for name in names}
+        if port == (443 if https else 80):
+            self.hosts.update(names)
         self.cookie = f"tv_session_{port}"
         self.session = secrets.token_urlsafe(32) if require_session else None
         self._launch = secrets.token_urlsafe(32) if require_session else None
@@ -44,25 +51,29 @@ class LocalGuard:
             await self.app(scope, receive, send)
             return
         headers = Headers(scope=scope)
-        host = headers.get("host", "")
-        if self.hosts is not None and host not in self.hosts:
+        host = headers.get("host", "").lower()
+        if host not in self.hosts:
             await self._deny(scope, receive, send, 400, "허용되지 않은 Host 입니다")
             return
         origin = headers.get("origin")
-        if origin is not None and origin not in (f"http://{host}", f"https://{host}"):
+        scheme = "https" if scope.get("scheme") in ("https", "wss") else "http"
+        if origin is not None and origin != f"{scheme}://{host}":
             await self._deny(scope, receive, send, 403, "다른 사이트에서 온 요청은 받지 않습니다")
             return
         if headers.get("sec-fetch-site") in ("cross-site", "same-site"):
             await self._deny(scope, receive, send, 403, "다른 사이트에서 온 요청은 받지 않습니다")
             return
         if self.session is not None:
-            if scope["type"] == "http" and scope["path"] == "/" and self._launch:
+            if scope["type"] == "http" and scope["method"] == "GET" and scope["path"] == "/" and self._launch:
                 query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
                 token = query.get("launch", [""])[0]
                 if token and _same(token, self._launch):
                     self._launch = None
-                    response = RedirectResponse("/", status_code=303)
-                    response.set_cookie(self.cookie, self.session, httponly=True, samesite="strict", path="/")
+                    response = RedirectResponse("/", status_code=303, headers={
+                        "cache-control": "no-store", "referrer-policy": "no-referrer",
+                    })
+                    response.set_cookie(self.cookie, self.session, httponly=True, samesite="strict", path="/",
+                                        secure=scope["scheme"] == "https")
                     await response(scope, receive, send)
                     return
             presented = cookie_parser(headers.get("cookie", "")).get(self.cookie, "")

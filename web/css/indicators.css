@@ -1,0 +1,33 @@
+.study-overlay-legends {
+  position: absolute; top: 26px; left: 9px; right: 78px; z-index: 4;
+  display: flex; flex-wrap: wrap; align-items: flex-start; gap: 2px 9px; pointer-events: none;
+}
+.study-overlay-legends:empty { display: none; }
+main:has(> .study-overlay-legends:not(:empty)) #style { top: calc(32px + var(--overlay-study-height, 0px)); }
+.study-legend {
+  display: inline-flex; align-items: center; gap: 5px; width: fit-content; max-width: calc(100% - 10px);
+  min-height: 20px; padding: 0 4px; border-radius: 3px; background: #131722dc;
+  font-size: 11px; line-height: 17px; font-variant-numeric: tabular-nums; pointer-events: auto;
+}
+.study-pane-legend { position: absolute; z-index: 4; left: 9px; }
+.study-name { color: #ced1d9; white-space: nowrap; }
+.study-value { white-space: nowrap; }
+.study-legend button {
+  min-width: 16px; padding: 0; line-height: 16px; background: transparent; border: 0;
+  border-radius: 3px; color: #9499a7; cursor: pointer; font-size: 14px;
+}
+.study-legend button:hover, .study-legend button:focus-visible { background: #363a45; color: #fff; }
+#study-settings {
+  min-width: min(320px, 85vw); max-height: 85vh; overflow: auto; color: #e4e5e8; color-scheme: dark;
+  background: #191a1e; border: 1px solid #414348; border-radius: 9px; padding: 20px;
+}
+#study-settings::backdrop { background: #0008; }
+#study-settings h2 { margin: 0 0 16px; font-size: 17px; }
+#study-settings label { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin: 8px 0; }
+#study-settings input { width: 86px; background: #24262b; border: 1px solid #464950; border-radius: 4px; padding: 4px 7px; }
+#study-settings input[type="color"] { height: 26px; padding: 2px 5px; }
+#study-settings footer { display: flex; justify-content: flex-end; gap: 6px; margin-top: 16px; }
+#study-settings footer button { padding: 5px 14px; border: 1px solid #54555d; background: #292b31; border-radius: 5px; cursor: pointer; }
+#study-settings footer button[type="submit"] { background: #edeef0; color: #17181b; }
+#study-settings .study-alert, #personal-script-editor .study-alert { margin-right: auto; }
+.study-settings-status { color: #ff8484; }

@@ -1,0 +1,22 @@
+# 이 PC 의 경로와 서명 키 (git 에 올리지 않습니다)
+local.properties
+signing/
+
+# 빌드 결과
+.gradle/
+build/
+app/build/
+.kotlin/
+*.apk
+.venv-compat/
+
+# IDE
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 파이썬
+__pycache__/
+*.pyc

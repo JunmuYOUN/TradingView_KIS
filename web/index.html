@@ -4,48 +4,158 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>KIS Tradingview</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cpath d=%22M1 13 6 7l3 3 6-7%22 stroke=%22%232962ff%22 stroke-width=%222%22 fill=%22none%22/%3E%3C/svg%3E">
+  <link rel="icon" href="/mint-candles.ico">
   <link rel="stylesheet" href="/css/style.css">
+  <link rel="stylesheet" href="/css/chart-workspace.css">
+  <link rel="stylesheet" href="/css/chart-types.css">
+  <link rel="stylesheet" href="/css/indicator-library.css">
+  <link rel="stylesheet" href="/css/indicators.css">
 </head>
 <body>
+  <nav id="view-tabs" role="tablist" aria-label="화면">
+    <button id="chart-tab" type="button" role="tab" aria-controls="chart-view" aria-selected="true">차트</button>
+    <button id="settings-tab" type="button" role="tab" aria-controls="settings-view" aria-selected="false" tabindex="-1">설정</button>
+  </nav>
+  <section id="chart-view" role="tabpanel" aria-labelledby="chart-tab" tabindex="-1">
   <header id="top">
     <div id="search">
-      <input id="symbol" placeholder="종목명·코드 검색 (초성 가능)" autocomplete="off" spellcheck="false" maxlength="40"
+      <input id="symbol" placeholder="종목·지수·선물·환율 검색" aria-label="종목·지수·선물·환율 검색" autocomplete="off" spellcheck="false" maxlength="40"
+        title="종목명이나 Yahoo 티커를 입력하세요 (ES=F, EURUSD=X, ^VIX)."
              role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="suggest">
       <div id="suggest" role="listbox" hidden></div>
     </div>
-    <div id="tfs" class="group"></div>
-    <span id="source" class="badge">…</span>
-    <span id="live" class="badge live" data-kind="off"><i></i><span id="live-text">연결 중</span></span>
-    <span id="status" class="status"></span>
+    <details id="interval-control" class="top-section">
+      <summary id="interval-label" aria-label="시간 간격">일</summary>
+      <div id="tfs" class="group" aria-label="시간 간격"><span id="index-interval-note" hidden></span></div>
+    </details>
+    <div id="chart-type-control" class="top-section"></div>
+    <div class="top-section indicator-actions">
+      <button id="indicators-button" class="chart-action" type="button"><svg aria-hidden="true"><use href="/toolbar-icons.svg#studies"/></svg>지표</button>
+      <button id="indicator-favorites" class="chart-action chevron" type="button" aria-label="즐겨찾는 지표" title="즐겨찾는 지표"><svg aria-hidden="true"><use href="/toolbar-icons.svg#down"/></svg></button>
+    </div>
+    <div class="top-section">
+      <button id="alerts-button" class="chart-action" type="button" aria-haspopup="dialog"><svg aria-hidden="true"><use href="/toolbar-icons.svg#alert"/></svg>얼러트</button>
+      <button id="replay-button" class="chart-action" type="button" aria-expanded="false" aria-controls="replay-strip"><svg aria-hidden="true"><use href="/toolbar-icons.svg#rewind"/></svg>리플레이</button>
+    </div>
   </header>
 
+  <div id="replay-strip" hidden>
+    <strong>바 리플레이</strong>
+    <button id="replay-pick" type="button" aria-pressed="false">시작 봉 선택</button>
+    <input id="replay-position" type="range" min="1" value="1" aria-label="리플레이 위치">
+    <output id="replay-date" for="replay-position"></output>
+    <button id="replay-play" type="button">재생</button><button id="replay-step" type="button">다음 봉</button>
+    <button id="replay-exit" type="button">실시간으로</button>
+  </div>
   <div id="body">
-    <nav id="side">
-      <div id="tools" class="vgroup"></div>
-      <hr>
-      <label class="check" title="점을 찍을 때 가장 가까운 시가·고가·저가·종가에 붙입니다"><input id="magnet" type="checkbox"> 자석</label>
-      <button id="undo" title="되돌리기 (Ctrl+Z)">되돌리기</button>
-      <button id="clear" title="이 종목의 선을 모두 지웁니다">모두 지우기</button>
-      <hr>
-      <div id="style" hidden>
-        <div class="label">선택한 선</div>
-        <label class="row">색 <input id="color" type="color"></label>
-        <label class="row">굵기
-          <select id="width"><option>1</option><option>1.5</option><option>2</option><option>3</option><option>4</option></select>
-        </label>
-        <label class="check" id="extend-wrap"><input id="extend" type="checkbox"> 오른쪽 연장</label>
-        <button id="del" class="danger" title="Delete 키">삭제</button>
-      </div>
-      <div class="foot"><span id="saved"></span></div>
-    </nav>
+    <nav id="tools" aria-label="차트 그리기 도구"></nav>
+    <div id="tool-menu" role="group" aria-label="그리기 도구 목록" hidden></div>
 
     <main>
-      <div id="legend"></div>
+      <div id="quote-legend">
+        <span id="quote-delay" role="status" hidden></span>
+        <div id="legend"></div>
+      </div>
       <div id="chart"></div>
+      <div id="style" role="group" aria-labelledby="style-name" hidden>
+        <strong id="style-name"></strong>
+        <span id="chart-style-fields"></span>
+        <button id="del" type="button" hidden>삭제</button>
+        <button id="close-style" type="button" title="선택 해제" aria-label="선택 해제">×</button>
+      </div>
     </main>
   </div>
+  <footer id="chart-statusbar">
+    <span id="source" class="badge">…</span>
+    <span id="live" class="badge live" data-kind="off"><i></i><span id="live-text">연결 중</span></span>
+    <button id="date-jump" type="button" aria-haspopup="dialog" hidden>날짜로 이동</button>
+    <span id="saved" role="status"></span>
+    <button id="drawing-retry" type="button" hidden>그림 다시 시도</button>
+    <button id="drawing-keep" type="button" hidden>내 편집본 저장</button>
+    <button id="drawing-reload" type="button" hidden>서버 그림 사용</button>
+    <span id="status" class="status"></span>
+    <button id="history-retry" type="button" hidden>이전 차트 다시 불러오기</button>
+    <button id="index-daily" type="button" hidden>일봉 보기</button>
+  </footer>
+  </section>
+  <section id="settings-view" role="tabpanel" aria-labelledby="settings-tab" tabindex="-1" hidden>
+    <h1>설정</h1>
+    <label for="domestic-market">국내 시세 거래소</label>
+    <select id="domestic-market" disabled>
+      <option value="J">KRX</option>
+      <option value="NX">NXT</option>
+      <option value="UN">KRX + NXT 통합</option>
+    </select>
+    <span id="market-status" role="status"></span>
+    <label class="price-fit-setting"><input id="fit-price-on-symbol" type="checkbox" checked> 종목 변경 시 가격축 자동 맞춤</label>
+    <button id="show-license" type="button">오픈소스 정보</button>
+  </section>
 
+  <dialog id="drawing-presets" aria-labelledby="presets-title">
+    <header>
+      <h2 id="presets-title">그리기 도구 관리</h2>
+      <form method="dialog"><button class="dismiss" aria-label="닫기">×</button></form>
+    </header>
+    <form id="preset-form">
+      <div class="preset-fields">
+        <label>도구 종류 <select id="preset-type"></select></label>
+        <label>이름 <input id="preset-name" type="text" maxlength="40" autocomplete="off"></label>
+      </div>
+      <div id="preset-style-fields" class="preset-fields"></div>
+      <div class="preset-actions">
+        <button id="save-preset" type="submit">도구막대에 추가</button>
+        <button id="cancel-preset" type="button" hidden>취소</button>
+        <span id="preset-status" role="status"></span>
+      </div>
+    </form>
+    <ul id="preset-list" aria-label="추가한 그리기 도구"></ul>
+  </dialog>
+
+  <dialog id="date-dialog" aria-labelledby="date-heading">
+    <form id="date-form">
+      <label id="date-heading" for="chart-date">날짜로 이동</label>
+      <input id="chart-date" type="text" placeholder="1980 또는 1980-01-02" autocomplete="off" spellcheck="false"
+             aria-describedby="date-feedback" maxlength="10" required>
+      <p id="date-feedback" role="status"></p>
+      <div><button id="date-cancel" type="button">취소</button><button id="date-submit" type="submit">이동</button></div>
+    </form>
+  </dialog>
+  <template id="style-fields-template">
+    <label>색 <input id="color" type="color"></label>
+    <label id="width-wrap">굵기 <select id="width" aria-label="선 굵기">
+      <option value="1">1 px</option><option value="1.5">1.5 px</option><option value="2">2 px</option>
+      <option value="3">3 px</option><option value="4">4 px</option><option value="6">6 px</option>
+    </select></label>
+    <label id="dash-wrap">선 종류 <select id="dash"><option value="solid">실선</option><option value="dashed">파선</option><option value="dotted">점선</option></select></label>
+    <label id="extend-wrap" hidden><input id="extend" type="checkbox">오른쪽 연장</label>
+    <label id="text-wrap" hidden>내용 <input id="note-text" type="text" maxlength="100"></label>
+    <label id="glyph-wrap" hidden>모양 <select id="glyph"><option>☺</option><option>★</option><option>✓</option><option>↑</option><option>↓</option></select></label>
+    <label id="font-wrap" hidden>크기 <select id="font-size"><option>12</option><option>16</option><option>20</option><option>24</option><option>32</option></select></label>
+  </template>
+
+  <dialog id="alerts-dialog" aria-labelledby="alert-heading">
+    <header><h2 id="alert-heading">가격 얼러트</h2><form method="dialog"><button class="dismiss" aria-label="닫기">×</button></form></header>
+    <p id="alert-symbol"></p>
+    <form id="price-alert-form">
+      <label id="alert-line-field" hidden>지표선<select id="alert-line"></select></label>
+      <label>조건<select id="alert-direction"><option value="up">상향 돌파</option><option value="down">하향 돌파</option><option value="either">양방향 돌파</option></select></label>
+      <label id="alert-price-field"><span id="alert-price-label">가격</span><input id="alert-price" type="number" step="any" min="0" required></label>
+      <div class="alert-form-actions">
+        <label class="alert-repeat-field"><input id="alert-repeat" type="checkbox"> 계속 알림</label>
+        <button type="submit">만들기</button>
+      </div>
+    </form>
+    <p id="alert-help" class="alert-help"></p>
+    <ul id="alert-list"></ul>
+    <p id="alert-feedback" role="status"></p>
+  </dialog>
+  <div id="alert-notice" role="status" hidden></div>
+  <dialog id="license" aria-labelledby="license-title">
+    <h2 id="license-title">오픈소스 정보</h2>
+    <p>TradingView Lightweight Charts™<br>Copyright (с) 2025 TradingView, Inc.</p>
+    <p><a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">TradingView</a> · Apache License 2.0</p>
+    <form method="dialog"><button>닫기</button></form>
+  </dialog>
   <script src="/vendor/lightweight-charts.standalone.production.js"></script>
   <script type="module" src="/js/app.js"></script>
 </body>

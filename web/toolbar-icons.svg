@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg">
+  <symbol id="cursor" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1v8m0 6v8M1 12h8m6 0h8"/></symbol>
+  <symbol id="trend" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="m4.5 19.5 15-15"/><circle cx="3.5" cy="20.5" r="1.8"/><circle cx="20.5" cy="3.5" r="1.8"/></symbol>
+  <symbol id="ray" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20 22 2m-6 0h6v6"/><circle cx="4" cy="20" r="1.8"/></symbol>
+  <symbol id="hline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h8m4 0h8"/><circle cx="12" cy="12" r="2"/></symbol>
+  <symbol id="channel" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="m2 16 16-11M6 21l16-11M6 16l10-7"/><circle cx="2" cy="16" r="1.3"/><circle cx="18" cy="5" r="1.3"/></symbol>
+  <symbol id="fib" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h20M3 9h16M3 15h19M5 21h17"/><circle cx="20" cy="9" r="1.7"/><circle cx="3" cy="21" r="1.7"/></symbol>
+  <symbol id="elliott5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="m3 19 4-14 6 11 5-12 3 16-14-15"/><g fill="var(--icon-fill, #101113)"><circle cx="3" cy="19" r="1.5"/><circle cx="7" cy="5" r="1.5"/><circle cx="13" cy="16" r="1.5"/><circle cx="18" cy="4" r="1.5"/><circle cx="21" cy="20" r="1.5"/></g></symbol>
+  <symbol id="elliottABC" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="m2 7 7 12 6-14 7 11"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="5" r="1.5"/></symbol>
+  <symbol id="range" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h18M2 12h18M4 20h18m-8-14v4M9 14v4"/><circle cx="3" cy="4" r="1.4"/><circle cx="3" cy="20" r="1.4"/></symbol>
+  <symbol id="brush" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M2 20c4-2 .8-8 6-8 4 0 3 4 8 0l6-7m-3-2c-2 5-5 7-7 5M2 20c4.5.5 9 .2 9-4"/></symbol>
+  <symbol id="text" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5V3h16v2m-8-2v18m-4 0h8"/></symbol>
+  <symbol id="marker" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><path d="M7.5 14.5c2 4 7 4 9 0M8 8.5h.5m7 0h.5"/></symbol>
+  <symbol id="ruler" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="m2 17 15-15 5 5L7 22Zm5-4 2 2m1-5 3 3m0-6 2 2m1-5 2 2"/></symbol>
+  <symbol id="zoom" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="m15 15 6 6M7 10h6m-3-3v6"/></symbol>
+  <symbol id="fit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5v14m20-14v14M12 6l1.5 4.5L17 12l-3.5 1.5L12 18l-1.5-4.5L7 12l3.5-1.5Z"/></symbol>
+  <symbol id="magnet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 20V10a7.5 7.5 0 0 1 15 0v10h-4v-9.8a3.5 3.5 0 0 0-7 0V20Zm0-5h4m7 0h4"/></symbol>
+  <symbol id="repeat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="m3 16 12-12 3 3L6 19l-4 1Zm10-10 3 3m1 7v-2a2 2 0 0 1 4 0v2"/><rect x="15" y="16" width="8" height="6" rx="1.5"/></symbol>
+  <symbol id="locked" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4m-4 4v2"/></symbol>
+  <symbol id="hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 12s4-6 10.5-6 10.5 6 10.5 6-4 6-10.5 6S1.5 12 1.5 12Z"/><circle cx="12" cy="12" r="2.7"/></symbol>
+  <symbol id="undo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5 2 10l5 5m-5-5h11c5 0 8 3 8 8"/></symbol>
+  <symbol id="clear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M9 6V3h6v3M6 6l1 15h10l1-15"/></symbol>
+  <symbol id="more" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></symbol>
+  <symbol id="vline" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 1v9m0 4v9"/><circle cx="12" cy="12" r="2"/></symbol>
+  <symbol id="arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21 20 4m-8 0h8v8"/></symbol>
+  <symbol id="rectangle" viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="2.5" y="5" width="19" height="14" rx=".5"/></symbol>
+  <symbol id="ellipse" viewBox="0 0 24 24" fill="none" stroke="currentColor"><ellipse cx="12" cy="12" rx="10" ry="7.5"/></symbol>
+  <symbol id="triangle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linejoin="round"><path d="m3 20 9-16 9 16Z"/></symbol>
+  <symbol id="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="studies" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linejoin="round"><path d="m2 13 5-4 4 3 7-8 3 2M3 21v-4h3v4zm6 0v-7h3v7zm6 0V11h3v10z"/></symbol>
+  <symbol id="down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><path d="M18 13a8 8 0 1 0-6 7M10 6v6l3 2M2 6l4-4m9 0 4 4m-2 13h6m-3-3v6"/></symbol>
+  <symbol id="rewind" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="m11 6-8 6 8 6Zm10 0-8 6 8 6Z"/></symbol>
+  <symbol id="favorite" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linejoin="round"><path d="m12 2.5 2.8 6 6.7 1-4.9 4.7 1.2 6.8-5.8-3.1L6 21l1.1-6.8-4.8-4.7 6.7-1Z"/></symbol>
+</svg>

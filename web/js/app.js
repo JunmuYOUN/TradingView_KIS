@@ -1,6 +1,13 @@
 import { TIMEFRAMES, bucketStart, isMinuteTf, tfSeconds } from './timeframe.js';
 import { TimeMap } from './timemap.js';
-import { DrawingManager, TOOLS, setPriceDecimals } from './drawings.js';
+import { DrawingManager, setPriceDecimals } from './drawings.js';
+import { createDrawingPersistence } from './drawing-persistence.js';
+import { setupDrawingToolbar } from './toolbar.js';
+import { setupChartTypes } from './chart-types.js';
+import { createIndicators, INDICATORS } from './indicators.js';
+import { setupIndicatorLibrary } from './indicator-library.js';
+import { setupReplay, setupPriceAlerts } from './chart-actions.js';
+import { mergeQuoteWindow, readQuoteWindow } from './quote-updates.js';
 
 const LC = window.LightweightCharts;
 
@@ -14,16 +21,28 @@ const state = {
   bars: [],
   ws: null,
   wsRetry: null,
+  quoteTransport: 'mock',
+  quoteStatus: null,
+  config: null,
   loadSeq: 0,
-  saveTimer: null,
+  loadedSeq: 0,
 };
 
-// 종목 코드: 국내 6자리(005930), 해외 거래소:티커(NAS:AAPL)
+// 주식과 지수는 거래소나 심볼이 겹쳐도 별개의 차트로 저장합니다.
 const DOMESTIC_RE = /^(?=.*\d)[0-9A-Z]{6}$/;
 const OVERSEAS_RE = /^(NAS|NYS|AMS):[A-Z0-9][A-Z0-9.-]{0,15}$/;
-const isCode = (c) => DOMESTIC_RE.test(c) || OVERSEAS_RE.test(c);
-const isOverseas = (code) => code.includes(':');
-const tickerOf = (code) => (isOverseas(code) ? code.split(':')[1] : code);
+const INDEX_RE = /^INDEX:(?:\d{4}|(?=.{1,10}$)\.?[A-Z][A-Z0-9]*(?:[.-][A-Z0-9]+)*)$/;
+const isIndex = code => INDEX_RE.test(code);
+const isYahoo = code => /^YF:(?=.{1,24}$)\^?[A-Z0-9][A-Z0-9.-]*(?:=[FX])?$/.test(code);
+const isCode = code => DOMESTIC_RE.test(code) || OVERSEAS_RE.test(code) || isIndex(code) || isYahoo(code);
+const isChartIndex = code => isIndex(code) || (isYahoo(code) && !code.includes('='));
+const usesHttpQuotes = code => isYahoo(code) || state.quoteTransport === 'https';
+const yahooPrecision = new Map();
+const tickerOf = code => code.slice(code.indexOf(':') + 1);
+const isUsIndex = code => isIndex(code) && !/^INDEX:\d{4}$/.test(code);
+const indexLabel = code => isUsIndex(code) ? '미국 지수' : '국내 지수';
+const paperIndexRestriction = () => isIndex(state.code) && state.config?.source === 'kis' && state.config.env === 'demo'
+  ? '한투 모의투자의 지수 차트는 일·주·월봉을 제공합니다.' : '';
 
 // 가격 표시: 국내는 원 단위, 해외는 달러 소수 2자리 (1달러 미만은 4자리)
 let priceDecimals = 0;
@@ -34,7 +53,7 @@ const fmtInt = (x) => Math.round(x).toLocaleString('ko-KR');
 const container = $('#chart');
 const chart = LC.createChart(container, {
   autoSize: true,
-  layout: { background: { color: '#131722' }, textColor: '#d1d4dc', fontFamily: '-apple-system, "Segoe UI", "Malgun Gothic", sans-serif' },
+  layout: { attributionLogo: false, background: { color: '#131722' }, textColor: '#d1d4dc', fontFamily: '-apple-system, "Segoe UI", "Malgun Gothic", sans-serif' },
   grid: { vertLines: { color: '#1e222d' }, horzLines: { color: '#1e222d' } },
   crosshair: { mode: LC.CrosshairMode.Normal },
   rightPriceScale: { borderColor: '#2a2e39' },
@@ -54,13 +73,78 @@ const volume = chart.addSeries(LC.HistogramSeries, {
 volume.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
 
 const timeMap = new TimeMap();
-const drawings = new DrawingManager({
-  chart, series: candles, container, timeMap, getBars: () => state.bars,
+let alerts;
+const replay = setupReplay(chart, () => state.loadedSeq === state.loadSeq ? state.bars : [], () => {
+  renderBars({ resetRange: true });
+  alerts.reset();
+  paintLive();
 });
+function displayedBars() { return replay.bars || state.bars; }
+const drawings = new DrawingManager({
+  chart, series: candles, container, timeMap, getBars: displayedBars,
+});
+const chartTypes = setupChartTypes({ chart, candles, getBars: displayedBars, getTimeframe: () => state.tf,
+  setTimeframe: switchTf, intradayRestriction: paperIndexRestriction, mount: $('#chart-type-control') });
+const studies = createIndicators({ chart, container,
+  openStudyAlert: target => alerts.openStudy(target),
+  onStudyAlertReset: (id, reason) => alerts?.targetChanged('study', id, reason),
+});
+let projectionBars = studies.projectionBars;
+function chartRightOffset() { return Math.max(12, projectionBars + 2); }
+function rangeWithProjection(range, last) {
+  if (!projectionBars || last < range.from || last > range.to) return range;
+  // Leave at least two thirds of a zoomed-in chart for the price history.
+  const room = Math.min(chartRightOffset(), (range.to - range.from) / 3);
+  const move = Math.max(0, last + room - range.to);
+  return { from: range.from + move, to: range.to + move };
+}
+chart.timeScale().applyOptions({ rightOffset: chartRightOffset() });
+studies.subscribe(() => {
+  if (studies.projectionBars === projectionBars) return;
+  projectionBars = studies.projectionBars;
+  const scale = chart.timeScale();
+  const range = scale.getVisibleLogicalRange();
+  scale.applyOptions({ rightOffset: chartRightOffset() }); // Also include the cloud when using Fit Content.
+  if (range) scale.setVisibleLogicalRange(rangeWithProjection(range, displayedBars().length - 1));
+});
+const indicatorLibrary = setupIndicatorLibrary({
+  button: $('#indicators-button'), favoritesButton: $('#indicator-favorites'), catalog: INDICATORS,
+  onAdd: id => studies.add(id), has: id => studies.has(id),
+  onPersonalScriptsChange: entries => studies.setPersonalScripts(entries),
+});
+alerts = setupPriceAlerts(() => ({
+  key: isYahoo(state.code) ? 'yahoo/' + state.code : [state.config?.source, state.config?.env, DOMESTIC_RE.test(state.code) ? state.config?.market : '', state.code].join('/'),
+  label: symbolLabel(state.code), price: state.bars.at(-1)?.close, formatPrice: isYahoo(state.code) ? fmtPrice : null,
+  allowNegative: isYahoo(state.code) && state.code.endsWith('=F'),
+  code: state.code, tf: state.tf, time: state.bars.at(-1)?.time,
+  chartReady: state.loadedSeq === state.loadSeq && !replay.bars,
+}), {
+  studyTarget: studies.alertTarget, studyValue: studies.alertValue,
+  drawingTarget: id => drawings.alertTarget(id), drawingValue: (id, time) => drawings.alertValue(id, time),
+});
+drawings.onAlertTargetChange = (id, reason) => alerts.targetChanged('drawing', id, reason);
 
 const volBar = (b) => ({ time: b.time, value: b.volume, color: b.close >= b.open ? 'rgba(239,83,80,.45)' : 'rgba(41,98,255,.45)' });
 
 // ------------------------------------------------------------ 데이터 로드
+let older = { hasMore: false, loading: false, error: '' };
+let chartRequest;
+let dateRequest;
+let selectedBarTime = null;
+let hoveredBarTime = null;
+let rangeFrame;
+let fitPriceForNewSymbol = false;
+const nearHistoryEdge = range => range && range.from < 16;
+chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+  cancelAnimationFrame(rangeFrame);
+  rangeFrame = requestAnimationFrame(() => {
+    updateLegend();
+    if (state.loadedSeq !== state.loadSeq || !state.bars.length || replay.bars) return;
+    if (nearHistoryEdge(chart.timeScale().getVisibleLogicalRange())) loadOlderBars();
+    showBarCount();
+  });
+});
+
 async function api(path, opts) {
   const r = await fetch(path, opts);
   const body = await r.json().catch(() => ({}));
@@ -68,61 +152,185 @@ async function api(path, opts) {
   return body;
 }
 
+async function chartData(path, code, tf, { before, since, fromDate, signal } = {}) {
+  const params = new URLSearchParams({ code, tf });
+  if (before != null) params.set('before', before);
+  if (since != null) params.set('since', since);
+  if (fromDate != null) params.set('from_date', fromDate);
+  const page = await api(`${path}?${params}`, { signal });
+  if (isYahoo(code) && page.source !== 'yahoo') throw new Error('Yahoo Finance 시세 출처를 확인할 수 없습니다.');
+  return page;
+}
+
 function applyPriceFormat(code, bars) {
   const last = bars.length ? bars[bars.length - 1].close : 0;
-  const d = isOverseas(code) ? (last > 0 && last < 1 ? 4 : 2) : 0;
+  let d = 0;
+  if (isYahoo(code)) d = yahooPrecision.get(code) ?? (code.endsWith('=X') ? 5 : 2);
+  else if (isIndex(code)) d = 2;
+  else if (OVERSEAS_RE.test(code)) d = last > 0 && last < 1 ? 4 : 2;
   if (d === priceDecimals) return;
   priceDecimals = d;
   setPriceDecimals(d);
   candles.applyOptions({ priceFormat: { type: 'price', precision: d, minMove: 1 / 10 ** d } });
 }
 
-async function loadCandles({ keepRange = false } = {}) {
+function renderStudies(bars, tailOnly = false) {
+  studies.setData(bars, { code: state.code, tf: state.tf, isIndex: isChartIndex(state.code),
+    rawVolume: isYahoo(state.code), pricePrecision: isYahoo(state.code) ? priceDecimals : undefined }, tailOnly);
+}
+
+function renderLatestBar() {
+  const bars = state.bars, bar = bars.at(-1);
+  applyPriceFormat(state.code, bars);
+  timeMap.push(bar.time);
+  candles.update({ ...bar });
+  volume.update(volBar(bar));
+  renderStudies(bars, true);
+  updateLegend();
+  $('#replay-button').disabled = bars.length < 2;
+  updateDateJump();
+}
+
+function renderBars({ range = null, resetRange = false } = {}) {
+  const bars = displayedBars();
+  applyPriceFormat(state.code, bars);
+  timeMap.setBars(bars, tfSeconds(state.tf), state.tf === 'D');
+  candles.setData(bars.map(bar => ({ ...bar })));
+  volume.setData(bars.map(volBar));
+  renderStudies(bars);
+  if (range) chart.timeScale().setVisibleLogicalRange(range);
+  else if (resetRange && bars.length) {
+    const range = { from: bars.length - 150, to: bars.length + 10 };
+    chart.timeScale().setVisibleLogicalRange(rangeWithProjection(range, bars.length - 1));
+  }
+  if (fitPriceForNewSymbol && bars.length && state.loadedSeq === state.loadSeq) {
+    if ($('#fit-price-on-symbol').checked) candles.priceScale().setAutoScale(true);
+    fitPriceForNewSymbol = false;
+  }
+  drawings.update();
+  updateLegend();
+  $('#replay-button').disabled = !replay.bars && bars.length < 2;
+  updateDateJump();
+}
+
+async function loadOlderBars() {
+  if (!older.hasMore || older.loading || older.error || replay.bars || state.loadedSeq !== state.loadSeq) return;
+  const before = state.bars[0]?.time;
+  if (before == null) return;
+  const seq = state.loadSeq;
+  older.loading = true;
+  showBarCount();
+  try {
+    const page = await chartData('/api/candles', state.code, state.tf, { before, signal: chartRequest.signal });
+    if (seq !== state.loadSeq) return;
+    const first = state.bars[0].time;
+    const prefix = page.bars.filter(bar => bar.time < first);
+    if (first === before || prefix.length) older.hasMore = Boolean(prefix.length && page.has_more);
+    if (prefix.length) {
+      // Anchor the range at response time, including any drag or zoom while the page was loading.
+      const range = chart.timeScale().getVisibleLogicalRange();
+      state.bars = prefix.concat(state.bars);
+      if (!replay.bars) {
+        renderBars({ range: range && { from: range.from + prefix.length, to: range.to + prefix.length } });
+        alerts.reset();
+      }
+    }
+  } catch (error) {
+    if (seq === state.loadSeq) older.error = error.message;
+  } finally {
+    if (seq === state.loadSeq) {
+      older.loading = false;
+      showBarCount();
+    }
+  }
+}
+
+async function loadCandles({ keepRange = false, preserveHistory = false } = {}) {
   const seq = ++state.loadSeq;
-  const range = keepRange ? chart.timeScale().getVisibleLogicalRange() : null;
+  hoveredBarTime = null;
+  if (!keepRange) selectedBarTime = null;
+  dateRequest?.abort();
+  if ($('#date-dialog').open) $('#date-dialog').close();
+  updateDateJump();
+  state.quoteStatus = null;
+  paintQuoteStatus();
+  chartRequest?.abort();
+  chartRequest = new AbortController();
+  const previous = older;
+  older = { hasMore: false, loading: false, error: '' };
   setStatus('loading', '차트 불러오는 중…');
   try {
-    const { bars } = await api(`/api/candles?code=${encodeURIComponent(state.code)}&tf=${state.tf}`);
+    const { bars, has_more, quote_status, earliest_available } = await chartData('/api/candles', state.code, state.tf, { signal: chartRequest.signal });
     if (seq !== state.loadSeq) return;
-    applyPriceFormat(state.code, bars);
-    state.bars = bars;
-    timeMap.setBars(bars, tfSeconds(state.tf), state.tf === 'D');
-    candles.setData(bars.map((b) => ({ ...b }))); // 라이브러리가 객체를 건드리지 않도록 복사본 전달
-    volume.setData(bars.map(volBar));
-    if (range) chart.timeScale().setVisibleLogicalRange(range);
-    else if (!keepRange) chart.timeScale().setVisibleLogicalRange({ from: bars.length - 150, to: bars.length + 10 });
-    drawings.update();
-    updateLegend();
-    setStatus('ok', `${bars.length}개 봉`);
-  } catch (e) {
-    if (seq === state.loadSeq) setStatus('error', `불러오기 실패: ${e.message}`);
-  }
-}
-
-async function loadDrawings() {
-  try {
-    const { drawings: list } = await api(`/api/drawings/${encodeURIComponent(state.code)}`);
-    drawings.load(list);
-  } catch (e) {
-    drawings.load([]);
-  }
-}
-
-function scheduleSave() {
-  clearTimeout(state.saveTimer);
-  const code = state.code;
-  const body = JSON.stringify({ drawings: drawings.toJSON() });
-  state.saveTimer = setTimeout(async () => {
-    try {
-      await api(`/api/drawings/${encodeURIComponent(code)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body });
-      $('#saved').textContent = '저장됨';
-    } catch (e) {
-      $('#saved').textContent = '저장 실패';
+    const previousBars = state.bars;
+    let range = keepRange ? chart.timeScale().getVisibleLogicalRange() : null;
+    const prefix = preserveHistory ? state.bars.filter(bar => !bars.length || bar.time < bars[0].time) : [];
+    older.hasMore = prefix.length ? previous.hasMore : Boolean(has_more);
+    older.firstAvailable = earliest_available ?? (prefix.length ? previous.firstAvailable : null);
+    state.loadedSeq = seq;
+    state.bars = prefix.concat(bars);
+    state.quoteStatus = quote_status ?? null;
+    paintQuoteStatus();
+    if (range && previousBars.length) {
+      const anchor = Math.max(0, Math.min(previousBars.length - 1, Math.round((range.from + range.to) / 2)));
+      const time = previousBars[anchor].time;
+      const next = state.bars.findIndex(bar => bar.time >= time);
+      range = next < 0 || time < state.bars[0].time ? null
+        : { from: range.from + next - anchor, to: range.to + next - anchor };
     }
-  }, 400);
-  $('#saved').textContent = '저장 중…';
+    if (!replay.bars) renderBars({ range, resetRange: !range });
+    alerts.reset();
+    showBarCount();
+  } catch (e) {
+    if (seq === state.loadSeq) {
+      if (preserveHistory && state.bars.length) {
+        state.loadedSeq = seq;
+        older.hasMore = previous.hasMore;
+      } else {
+        state.bars = [];
+        if (!replay.bars) renderBars();
+      }
+      setStatus('error', `불러오기 실패: ${e.message}`);
+    }
+  }
 }
-drawings.onChange = scheduleSave;
+
+const drawingPath = code => '/api/drawings/' + encodeURIComponent(code);
+const drawingStore = createDrawingPersistence({
+  storage: localStorage,
+  read: code => api(drawingPath(code)),
+  async write(code, base, text) {
+    const response = await fetch(drawingPath(code), {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ base_revision: base, drawings: JSON.parse(text) }),
+    });
+    const data = await response.json();
+    if (response.status === 409) return { ...data, conflict: true };
+    if (!response.ok) throw new Error(data.detail || '그림 저장 실패');
+    return data;
+  },
+  display: list => drawings.load(list),
+  status(message, retry, conflict) {
+    $('#saved').textContent = message;
+    $('#drawing-retry').hidden = !retry;
+    $('#drawing-keep').hidden = $('#drawing-reload').hidden = !conflict;
+  },
+});
+drawings.onChange = () => drawingStore.change(drawings.toJSON());
+$('#drawing-retry').onclick = () => drawingStore.retry();
+$('#drawing-keep').onclick = () => {
+  if (confirm('서버에 저장된 그림을 현재 편집본으로 바꿀까요?')) drawingStore.resolve(true);
+};
+$('#drawing-reload').onclick = () => {
+  if (confirm('현재 편집본을 버리고 서버의 그림을 불러올까요?')) drawingStore.resolve(false);
+};
+window.addEventListener('online', drawingStore.recover);
+document.addEventListener('visibilitychange', () => { if (document.hidden) drawingStore.flushAll(); });
+window.addEventListener('pagehide', () => drawingStore.flushAll());
+window.addEventListener('beforeunload', event => {
+  if (drawingStore.unprotectedEdits) { event.preventDefault(); event.returnValue = true; }
+});
+drawingStore.recover();
 
 // ------------------------------------------------------------ 실시간
 function applyTick({ t, p, v }) {
@@ -131,60 +339,109 @@ function applyTick({ t, p, v }) {
   const last = bars[bars.length - 1];
   const bNew = bucketStart(t, state.tf);
   const bLast = bucketStart(last.time, state.tf);
-  let bar;
   if (bNew === bLast) {
     last.high = Math.max(last.high, p);
     last.low = Math.min(last.low, p);
     last.close = p;
     last.volume += v;
-    bar = last;
   } else if (bNew > bLast) {
-    bar = { time: bNew, open: p, high: p, low: p, close: p, volume: v };
-    bars.push(bar);
-    timeMap.push(bNew);
+    bars.push({ time: bNew, open: p, high: p, low: p, close: p, volume: v });
   } else {
     return; // 이미 지난 봉의 틱
   }
-  candles.update({ ...bar });
-  volume.update(volBar(bar));
-  updateLegend();
+  if (!replay.bars) renderLatestBar();
+  alerts.observeBars(bars, bars.length - 1);
 }
 
-function connectWs() {
+let quoteRequest;
+function stopQuotes() {
+  quoteRequest?.abort();
   if (state.ws) {
-    state.ws.onclose = null;
+    state.ws.onopen = state.ws.onmessage = state.ws.onclose = null;
     state.ws.close();
+    state.ws = null;
   }
   clearTimeout(state.wsRetry);
+}
+
+function followQuotes() {
+  stopQuotes();
   const code = state.code;
+  if (usesHttpQuotes(code)) {
+    const controller = new AbortController();
+    quoteRequest = controller;
+    const yahoo = isYahoo(code);
+    const tf = state.tf;
+    const seq = state.loadSeq;
+    const pollingInfo = yahoo ? 'Yahoo Finance 시세를 1분 간격으로 조회합니다. 거래소에 따라 지연될 수 있습니다.'
+      : '한투 HTTPS 시세를 5초 간격으로 조회합니다.';
+    const interval = yahoo ? 60000 : 5000;
+    let delay = interval;
+    const current = () => !controller.signal.aborted && seq === state.loadSeq && code === state.code && tf === state.tf;
+    async function refresh() {
+      if (!current()) return;
+      try {
+        const initial = state.loadedSeq !== seq || !state.bars.length;
+        const page = initial ? await chartData('/api/candles', code, tf, { signal: controller.signal })
+          : await readQuoteWindow((since, before) => chartData('/api/quotes/latest', code, tf,
+            { since, before, signal: controller.signal }), state.bars.at(-1).time);
+        if (!current()) return;
+        if (initial) older.hasMore = Boolean(page.has_more);
+        state.loadedSeq = seq;
+        state.quoteStatus = page.quote_status ?? null;
+        if (page.bars.length) {
+          const update = mergeQuoteWindow(state.bars, page.bars, page.recovery);
+          if (update.changes && !replay.bars) {
+            if (update.tailOnly && !initial) renderLatestBar();
+            else renderBars({ resetRange: initial });
+          }
+          if (page.recovery === 'unavailable') older.quoteGap = true;
+          if (update.reset || initial) alerts.reset();
+          else if (update.changes) alerts.observeBars(state.bars, update.observeFrom, update.rebase ? update.anchor : -1);
+        }
+        showBarCount();
+        setLive('secure', pollingInfo);
+        delay = interval;
+      } catch (error) {
+        if (!current()) return;
+        state.quoteStatus = null;
+        setLive('error', `시세 갱신 실패 · ${error.message}`);
+        delay = Math.min(delay * 2, yahoo ? 300000 : 60000);
+      }
+      state.wsRetry = setTimeout(refresh, delay);
+    }
+    setLive('secure', pollingInfo);
+    state.wsRetry = setTimeout(refresh, delay);
+    return;
+  }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws/ticks?code=${encodeURIComponent(code)}`);
   state.ws = ws;
   let opened = false;
   ws.onopen = () => {
     opened = true;
-    setLive('connecting', '실시간 연결 중');
+    setLive('connecting', '데모 시세 연결 중');
   };
   ws.onmessage = (ev) => {
     // 종목을 바꾼 뒤 새 차트를 불러오는 동안에도 이전 종목의 연결이 잠시 남아 있습니다.
     // 그 틱이 새 종목의 봉에 섞이지 않게 버립니다.
-    if (state.code !== code) return;
+    if (state.code !== code || state.loadedSeq !== state.loadSeq) return;
     const msg = JSON.parse(ev.data);
     if (msg.type === 'tick') {
       applyTick(msg);
-      setLive('live', '실시간');
+      setLive('live');
     } else if (msg.type === 'status') {
       setLive(msg.state, msg.msg);
     } else if (msg.type === 'resync') {
-      loadCandles({ keepRange: true });
+      loadCandles({ keepRange: true, preserveHistory: true });
     }
   };
   ws.onclose = () => {
-    setLive('off', '실시간 끊김, 다시 연결합니다');
+    setLive('off', '데모 시세 연결이 끊겨 다시 연결합니다.');
     state.wsRetry = setTimeout(() => {
       if (state.code !== code) return;
-      connectWs();
-      if (opened) loadCandles({ keepRange: true }); // 끊긴 사이의 봉을 다시 받습니다
+      followQuotes();
+      if (opened) loadCandles({ keepRange: true, preserveHistory: true }); // 끊긴 사이의 봉을 다시 받습니다
     }, 2000);
   };
 }
@@ -194,36 +451,213 @@ function setStatus(kind, text) {
   const el = $('#status');
   el.textContent = text;
   el.dataset.kind = kind;
+  el.title = text;
+  $('#history-retry').hidden = kind !== 'history-error';
+  $('#index-daily').hidden = !(['empty', 'error'].includes(kind) && !state.bars.length
+    && isIndex(state.code) && isMinuteTf(state.tf) && state.config?.source === 'kis');
 }
 
+function isoDay(time) { return new Date(time * 1000).toISOString().slice(0, 10); }
+
+function updateDateJump() {
+  const button = $('#date-jump');
+  button.hidden = !isYahoo(state.code) || isMinuteTf(state.tf);
+  button.disabled = Boolean(replay.bars) || state.loadedSeq !== state.loadSeq || !state.bars.length;
+}
+
+function setupDateJump() {
+  const dialog = $('#date-dialog');
+  const input = $('#chart-date');
+  const feedback = $('#date-feedback');
+  const submit = $('#date-submit');
+  $('#date-jump').onclick = () => {
+    const visible = chart.timeScale().getVisibleLogicalRange();
+    const center = visible ? Math.round((visible.from + visible.to) / 2) : state.bars.length - 1;
+    input.value = isoDay(state.bars[Math.max(0, Math.min(center, state.bars.length - 1))].time);
+    feedback.textContent = '1980이나 1980-01-02처럼 입력하세요.';
+    submit.disabled = false;
+    dialog.showModal();
+    input.select();
+  };
+  $('#date-cancel').onclick = () => dialog.close();
+  dialog.addEventListener('close', () => dateRequest?.abort());
+  $('#date-form').onsubmit = async event => {
+    event.preventDefault();
+    const value = input.value.trim();
+    const date = /^\d{4}$/.test(value) ? value + '-01-01' : value;
+    const day = Date.parse(date + 'T00:00:00Z') / 1000;
+    const now = new Date();
+    const today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / 1000;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(day) || isoDay(day) !== date
+      || date < '1800-01-01' || day > today) {
+      feedback.textContent = '1800년부터 오늘까지의 연도나 날짜를 입력하세요.';
+      return;
+    }
+    const before = state.bars[0]?.time;
+    if (before == null || replay.bars || submit.disabled) return;
+    const bucket = bucketStart(day, state.tf);
+    let appended = false;
+    if (bucket < before && (older.hasMore || older.firstAvailable == null)) {
+      dateRequest?.abort();
+      const request = new AbortController();
+      dateRequest = request;
+      submit.disabled = true;
+      feedback.textContent = '과거 시세를 불러오는 중…';
+      try {
+        const page = await chartData('/api/candles', state.code, state.tf, { before, fromDate: day, signal: request.signal });
+        if (request.signal.aborted || !dialog.open || replay.bars) return;
+        // Ordinary left-edge paging or current quotes may finish during this request.
+        const first = state.bars[0].time;
+        const prefix = page.bars.filter(bar => bar.time < first);
+        older.firstAvailable = page.earliest_available;
+        if (first === before || prefix.length) older.hasMore = Boolean(page.has_more);
+        if (prefix.length) {
+          state.bars = prefix.concat(state.bars);
+          appended = true;
+          older.error = '';
+        }
+      } catch (error) {
+        if (!request.signal.aborted) feedback.textContent = `이동할 날짜를 불러오지 못했습니다. ${error.message}`;
+        return;
+      } finally {
+        if (dateRequest === request) {
+          dateRequest = null;
+          submit.disabled = false;
+        }
+      }
+    }
+    const index = state.bars.findIndex(bar => bar.time >= bucket);
+    const target = index < 0 ? state.bars.length - 1 : index;
+    selectedBarTime = state.bars[target].time;
+    hoveredBarTime = null;
+    const scale = chart.timeScale();
+    const visible = scale.getVisibleLogicalRange();
+    const width = visible ? visible.to - visible.from : 160;
+    const from = Math.max(0, Math.min(target - width / 2, state.bars.length - width + chartRightOffset()));
+    const range = { from, to: from + width };
+    if (appended) {
+      renderBars({ range });
+      alerts.reset();
+    }
+    else scale.setVisibleLogicalRange(range);
+    updateLegend();
+    dialog.close();
+    showBarCount();
+  };
+}
+
+function showBarCount() {
+  const count = `${state.bars.length}개 봉` + (older.quoteGap ? ' · 시세 공백 있음' : '');
+  const nxtPeriod = state.config?.source === 'kis' && state.config.market === 'NX'
+    && DOMESTIC_RE.test(state.code) && !isMinuteTf(state.tf);
+  if (!state.bars.length && nxtPeriod) return setStatus('empty', '이 종목의 NXT 시세가 없습니다. 설정에서 KRX를 선택할 수 있습니다.');
+  if (!state.bars.length && isYahoo(state.code)) return setStatus('empty', 'Yahoo Finance에서 이 기간의 시세를 제공하지 않습니다.');
+  if (!state.bars.length && isIndex(state.code)) return setStatus('empty', '이 기간에 조회된 지수 봉이 없습니다.');
+  if (state.bars.length && !replay.bars && nearHistoryEdge(chart.timeScale().getVisibleLogicalRange())) {
+    if (older.loading) return setStatus('loading', '이전 차트 불러오는 중…');
+    if (older.error) return setStatus('history-error', `이전 차트 조회 실패 · ${older.error}`);
+    if (!older.hasMore) {
+      const first = new Date(state.bars[0].time * 1000).toISOString().slice(0, 10);
+      if (isYahoo(state.code) && Number.isFinite(older.firstAvailable)) {
+        return setStatus('ok', `${count} · Yahoo Finance 첫 시세 ${isoDay(older.firstAvailable)}`);
+      }
+      if (nxtPeriod) return setStatus('ok', `NXT 첫 봉 ${first} · 더 오래된 한국거래소 시세는 설정에서 KRX를 선택하세요.`);
+      return setStatus('ok', `${count} · 조회 가능한 첫 봉 ${first}`);
+    }
+  }
+  setStatus('ok', count);
+}
+let liveState = { kind: 'connecting', text: '' };
 function setLive(kind, text) {
-  const el = $('#live');
-  el.dataset.kind = kind;
-  el.title = text || '';
-  $('#live-text').textContent = kind === 'live' ? 'LIVE' : kind === 'error' ? '오류' : kind === 'off' ? '끊김' : '연결 중';
+  liveState = { kind, text };
+  paintLive();
   if (kind === 'error') setStatus('error', text);
 }
 
-function updateLegend(bar) {
-  const b = bar || state.bars[state.bars.length - 1];
-  if (!b) return;
-  const i = state.bars.indexOf(b);
-  const prev = i > 0 ? state.bars[i - 1] : null;
+function paintLive() {
+  paintQuoteStatus();
+  const { kind, text } = liveState;
+  const el = $('#live');
+  if (replay.bars) {
+    el.dataset.kind = 'replay';
+    el.title = '과거 시세 재생 중';
+    $('#live-text').textContent = '리플레이';
+    return;
+  }
+  el.dataset.kind = kind;
+  el.title = kind === 'live' ? '앱에서 생성한 가격과 거래량을 갱신합니다.' : text || '';
+  const secureLabel = isYahoo(state.code) ? '1분 갱신' : 'HTTPS · 5초';
+  $('#live-text').textContent = kind === 'secure' ? secureLabel : kind === 'live' ? '자동 갱신' : kind === 'error' ? '오류' : kind === 'off' ? '끊김' : '연결 중';
+}
+
+function paintQuoteStatus() {
+  const badge = $('#quote-delay');
+  const info = state.quoteStatus;
+  let label = '', title = '', kind = 'delayed';
+  if (info && state.bars.length && !replay.bars
+    && (isYahoo(state.code) || state.config?.source === 'kis')) {
+    const venue = isYahoo(state.code) ? 'Yahoo Finance' : '한국투자증권';
+    const closed = info.market_open === false;
+    const session = info.market_state === 'pre' ? '정규장 전' : info.market_state === 'post' ? '정규장 후' : '장 마감';
+    if (info.end_of_day === true) {
+      kind = 'close';
+      label = '종가 시세';
+      title = `${venue}에서 장 마감 종가를 제공합니다.`;
+    } else if (Number.isInteger(info.delay_minutes) && info.delay_minutes > 0) {
+      label = closed ? `${session} · ${info.delay_minutes}분 지연 시세` : `${info.delay_minutes}분 지연`;
+      title = info.delay_source === 'exchange' ? `${venue} · 거래소 공시 기준 지연 시간입니다.`
+        : `${venue}에서 안내한 종목 시세 지연 시간입니다.`;
+    } else if (info.feed === 'delayed' || (info.delay_minutes !== 0 && info.delayed === true)) {
+      label = closed ? `${session} · 지연 시세` : '지연 시세';
+      title = `${venue}에서 지연 시세로 제공합니다.`;
+    } else if (info.delayed_or_close === true && info.market_open !== false) {
+      kind = 'close';
+      label = '지연 또는 종가 시세';
+      title = `${venue}에서 지연 시세 또는 종가로 제공합니다. 정확한 지연 시간은 공개되지 않습니다.`;
+    } else if (info.market_open === true && (info.stale === true || (info.stale == null
+      && info.delay_minutes !== 0 && info.feed !== 'realtime' && info.delayed !== false))
+      && isMinuteTf(state.tf) && Number.isFinite(info.as_of) && info.as_of > 0) {
+      const age = Math.floor((Date.now() / 1000 - info.as_of) / 60);
+      if (age >= (info.stale === true ? 1 : 5)) {
+        kind = 'observed';
+        label = `최근 시세 ${age}분 전`;
+        title = `${venue} 마지막 시세 시각 · ${new Date(info.as_of * 1000).toLocaleString('ko-KR')}`;
+      }
+    }
+  }
+  if (badge.textContent !== label) badge.textContent = label;
+  badge.hidden = !label;
+  badge.dataset.kind = kind;
+  badge.title = title;
+}
+
+function updateLegend() {
+  const bars = displayedBars();
+  if (!bars.length) { $('#legend').textContent = ''; return; }
+  const range = chart.timeScale().getVisibleLogicalRange();
+  const last = bars.length - 1;
+  const end = range ? Math.max(0, Math.min(last, Math.floor(range.to))) : last;
+  const anchor = hoveredBarTime ?? selectedBarTime;
+  const selected = anchor == null ? -1 : Math.round(timeMap.toLogical(anchor));
+  const inView = range && selected >= Math.floor(range.from) && selected <= Math.ceil(range.to);
+  const i = inView && bars[selected]?.time === anchor ? selected : end;
+  const b = bars[i];
+  const prev = i > 0 ? bars[i - 1] : null;
   const chg = prev ? b.close - prev.close : 0;
   const pct = prev ? (chg / prev.close) * 100 : 0;
   const f = fmtPrice;
   const cls = chg > 0 ? 'up' : chg < 0 ? 'down' : '';
   $('#legend').innerHTML =
+    (i < last ? `<span class="legend-date">${isoDay(b.time)}</span>` : '') +
     `<span>시 <b>${f(b.open)}</b></span><span>고 <b>${f(b.high)}</b></span>` +
-    `<span>저 <b>${f(b.low)}</b></span><span>종 <b class="${cls}">${f(b.close)}</b></span>` +
+    `<span>저 <b>${f(b.low)}</b></span><span>종 <b class="${cls}">${f(b.close)}</b>${isChartIndex(state.code) ? ' pt' : ''}</span>` +
     `<span class="${cls}">${chg >= 0 ? '+' : ''}${f(chg)} (${pct.toFixed(2)}%)</span>` +
-    `<span>거래량 <b>${fmtInt(b.volume)}</b></span>`;
+    `<span>거래량 <b>${(isChartIndex(state.code) || state.code.endsWith('=X')) && !b.volume ? '—' : fmtInt(b.volume)}</b></span>`;
 }
 
 chart.subscribeCrosshairMove((param) => {
-  if (!param || param.time === undefined) return updateLegend();
-  const bar = state.bars.find((x) => x.time === param.time);
-  updateLegend(bar);
+  hoveredBarTime = typeof param?.time === 'number' ? param.time : null;
+  updateLegend();
 });
 
 function buildToolbar() {
@@ -232,48 +666,22 @@ function buildToolbar() {
     const b = document.createElement('button');
     b.textContent = t.label;
     b.dataset.tf = t.id;
-    b.onclick = () => switchTf(t.id);
-    tfBox.appendChild(b);
+    b.onclick = () => { $('#interval-control').open = false; switchTf(t.id); };
+    tfBox.insertBefore(b, $('#index-interval-note'));
   }
-  const toolBox = $('#tools');
-  for (const [id, t] of Object.entries(TOOLS)) {
-    const b = document.createElement('button');
-    b.textContent = t.label;
-    b.dataset.tool = id;
-    b.title = `${t.label} (단축키 ${t.key.toUpperCase()})`;
-    b.onclick = () => drawings.setTool(id);
-    toolBox.appendChild(b);
-  }
-  $('#magnet').checked = drawings.magnet;
-  $('#magnet').onchange = (e) => drawings.setMagnet(e.target.checked);
-  $('#undo').onclick = () => drawings.undo();
-  $('#clear').onclick = () => {
-    if (confirm('이 종목에 그린 선을 모두 지울까요?')) drawings.clearAll();
-  };
-  $('#del').onclick = () => drawings.deleteSelected();
-  $('#color').oninput = (e) => drawings.setSelectedStyle({ color: e.target.value });
-  $('#width').onchange = (e) => drawings.setSelectedStyle({ width: Number(e.target.value) });
-  $('#extend').onchange = (e) => drawings.setSelectedStyle({ extend: e.target.checked });
-
+  document.addEventListener('pointerdown', event => {
+    if (!event.target.closest('#interval-control')) $('#interval-control').open = false;
+  });
+  $('#interval-control').addEventListener('keydown', event => {
+    if (event.key === 'Escape') { $('#interval-control').open = false; $('#interval-label').focus(); }
+  });
+  setupDrawingToolbar(drawings, chart, target => alerts.openDrawing(target));
   setupSearch();
-
-  drawings.onToolChange = (tool) => {
-    document.querySelectorAll('#tools button').forEach((b) => b.classList.toggle('on', b.dataset.tool === tool));
-  };
-  drawings.onSelect = (d) => {
-    $('#style').hidden = !d;
-    if (!d) return;
-    $('#color').value = (d.style && d.style.color) || TOOLS[d.type].color;
-    $('#width').value = String((d.style && d.style.width) || 1.5);
-    $('#extend-wrap').hidden = d.type !== 'fib';
-    $('#extend').checked = !!(d.style && d.style.extend);
-  };
-  drawings.onToolChange('cursor');
-  drawings.onSelect(null);
 }
 
 // ------------------------------------------------------------ 종목 검색 · 검색 기록
 const names = new Map(); // 종목코드 -> 종목명 (검색 결과·기록·서버 조회에서 알게 된 이름)
+const savedYahooKey = 'kis.lastYahooSymbol';
 const symbolInput = $('#symbol');
 const suggest = $('#suggest');
 const search = { mode: 'closed', list: [], active: -1, query: '', emptyText: '', seq: 0, timer: null, history: [] };
@@ -293,17 +701,31 @@ function symbolLabel(code) {
 function showSymbol(code) {
   if (document.activeElement !== symbolInput) symbolInput.value = symbolLabel(code);
   document.title = `${names.get(code) || tickerOf(code)} · KIS Tradingview`;
+  if (isYahoo(code) && yahooPrecision.has(code)) {
+    try {
+      localStorage.setItem(savedYahooKey, JSON.stringify({ code, name: names.get(code), precision: yahooPrecision.get(code) }));
+    } catch { /* 현재 차트에서는 조회한 정밀도를 그대로 사용합니다. */ }
+  }
 }
 
 function learnNames(items) {
-  for (const it of items) if (it.name) names.set(it.code, it.name);
+  for (const it of items) {
+    if (it.name) names.set(it.code, it.name);
+    if (isYahoo(it.code) && Number.isInteger(it.precision) && it.precision >= 0 && it.precision <= 10) {
+      yahooPrecision.set(it.code, it.precision);
+    }
+  }
 }
 
 async function lookupName(code) {
   try {
     const s = await api(`/api/symbols/${encodeURIComponent(code)}`);
-    if (s.name) names.set(code, s.name);
-    if (state.code === code) showSymbol(code);
+    const oldPrecision = yahooPrecision.get(code);
+    learnNames([s]);
+    if (state.code === code) {
+      showSymbol(code);
+      if (oldPrecision !== yahooPrecision.get(code) && state.loadedSeq === state.loadSeq && displayedBars().length) renderBars();
+    }
   } catch (e) { /* 이름을 몰라도 코드로 볼 수 있습니다 */ }
 }
 
@@ -364,7 +786,10 @@ function renderSuggest() {
     row.setAttribute('role', 'option');
     row.append(nameCell(item.name || '이름 모름', isHistory ? '' : search.query),
       el('span', 'sg-code', item.symbol || tickerOf(item.code)),
-      el('span', 'sg-kind', item.kind && item.kind !== '주식' ? item.kind : item.market || ''));
+      el('span', 'sg-kind', isYahoo(item.code) ? [item.kind, 'Yahoo'].filter(Boolean).join(' · ')
+        : item.code === 'INDEX:VIX' ? indexLabel(item.code) + (state.config?.source === 'kis' ? ' · 한투' : ' · 데모')
+        : isIndex(item.code) ? indexLabel(item.code)
+        : item.kind && item.kind !== '주식' ? item.kind : item.market || ''));
     if (isHistory) {
       const del = el('button', 'sg-del', '×');
       del.type = 'button';
@@ -417,7 +842,7 @@ async function runSearch(q) {
   } catch (e) {
     emptyText = `검색 실패: ${e.message}`;
   }
-  if (seq !== search.seq || document.activeElement !== symbolInput) return;
+  if (seq !== search.seq || document.activeElement !== symbolInput || symbolInput.value.trim() !== q) return;
   learnNames(items);
   Object.assign(search, { mode: 'results', list: items, active: items.length ? 0 : -1, query: q, emptyText });
   renderSuggest();
@@ -433,7 +858,8 @@ function refreshSuggest() {
 async function submitSearch() {
   clearTimeout(search.timer);
   const text = symbolInput.value.trim();
-  const shown = search.mode === 'history' || (search.mode === 'results' && search.query === text);
+  const shown = (search.mode === 'history' && (!text || text === symbolLabel(state.code)))
+    || (search.mode === 'results' && search.query === text);
   if (shown && search.active >= 0) return choose(search.list[search.active]);
   if (!text || text === symbolLabel(state.code)) {
     closeSuggest();
@@ -441,9 +867,13 @@ async function submitSearch() {
     return;
   }
   const code = parseCode(text);
-  if (code) return choose({ code, name: names.get(code) || '' });
+  if (code && (names.has(code) || OVERSEAS_RE.test(code) || /^\d{6}$/.test(code))) {
+    return choose({ code, name: names.get(code) || '' });
+  }
   await runSearch(text); // 결과가 오기 전에 Enter 를 누른 경우: 첫 번째 결과로 엽니다
-  if (search.query === text && search.list.length) choose(search.list[0]);
+  if (search.mode !== 'results' || search.query !== text || symbolInput.value.trim() !== text) return;
+  if (search.list.length) choose(search.list[0]);
+  else if (code && DOMESTIC_RE.test(code)) choose({ code, name: '' }); // 마스터에 없는 국내 종목
 }
 
 function choose(item) {
@@ -535,39 +965,163 @@ function setupSearch() {
 
 async function switchCode(code, { name = '', record = false } = {}) {
   if (!isCode(code || '')) {
-    setStatus('error', '종목명 일부, 6자리 종목코드, 해외 티커를 입력해 목록에서 고르세요');
+    setStatus('error', '종목·지수 이름이나 코드를 입력해 목록에서 고르세요');
     return;
+  }
+  replay.stop(false);
+  stopQuotes();
+  setLive('connecting', '시세를 불러오는 중입니다.');
+  if (state.code !== code) {
+    fitPriceForNewSymbol = true;
+    state.bars = [];
+    renderBars();
   }
   if (name) names.set(code, name);
   state.code = code;
+  const preferred = localStorage.getItem('kis.tf') || 'D';
+  const available = TIMEFRAMES.some(t => t.id === preferred) && !(isMinuteTf(preferred) && paperIndexRestriction());
+  applyTimeframe(available ? preferred : 'D');
+  updateSourceBadge();
   localStorage.setItem('kis.code', code);
   showSymbol(code);
-  if (!names.has(code)) lookupName(code);
+  if (!names.has(code) || isYahoo(code)) lookupName(code);
   if (record) addHistory(code, names.get(code) || '');
-  await Promise.all([loadCandles(), loadDrawings()]);
-  connectWs();
+  const loading = loadCandles();
+  const seq = state.loadSeq;
+  await Promise.all([loading, drawingStore.select(code)]);
+  if (state.loadSeq === seq) followQuotes();
+}
+
+function applyTimeframe(tf) {
+  state.tf = tf;
+  updateDateJump();
+  const restriction = paperIndexRestriction();
+  const label = $('#interval-label');
+  label.textContent = TIMEFRAMES.find(t => t.id === tf).label;
+  label.title = restriction || '시간 간격';
+  const note = $('#index-interval-note');
+  note.textContent = restriction;
+  note.hidden = !restriction;
+  document.querySelectorAll('#tfs button').forEach(b => {
+    b.classList.toggle('on', b.dataset.tf === tf);
+    b.disabled = Boolean(restriction) && isMinuteTf(b.dataset.tf);
+    b.title = b.disabled ? restriction : '';
+  });
+  chart.applyOptions({ timeScale: { timeVisible: isMinuteTf(tf) } });
 }
 
 async function switchTf(tf) {
-  state.tf = tf;
+  if (isMinuteTf(tf) && paperIndexRestriction()) return;
+  replay.stop(false);
+  stopQuotes();
+  setLive('connecting', '시세를 불러오는 중입니다.');
   localStorage.setItem('kis.tf', tf);
-  document.querySelectorAll('#tfs button').forEach((b) => b.classList.toggle('on', b.dataset.tf === tf));
-  chart.applyOptions({ timeScale: { timeVisible: isMinuteTf(tf) } });
-  await loadCandles();
+  applyTimeframe(tf);
+  const loading = loadCandles();
+  const seq = state.loadSeq;
+  await loading;
+  if (state.loadSeq === seq) followQuotes();
+}
+
+function updateSourceBadge() {
+  const cfg = state.config;
+  const badge = $('#source');
+  if (isYahoo(state.code)) {
+    badge.textContent = 'Yahoo Finance';
+    badge.title = 'Yahoo Finance에서 받은 시장 시세입니다. 시세 지연 시간은 거래소마다 다릅니다.';
+    badge.dataset.kind = 'yahoo';
+    return;
+  }
+  if (!cfg) return;
+  const market = Array.from($('#domestic-market').options).find(option => option.value === cfg.market);
+  const venue = isIndex(state.code) ? ` · ${indexLabel(state.code)}`
+    : DOMESTIC_RE.test(state.code) ? ` · ${market.label}` : '';
+  badge.textContent = cfg.source === 'kis' ? `KIS ${cfg.env === 'real' ? '실전' : '모의'}${venue}` : '데모 · 가상 시세';
+  badge.title = paperIndexRestriction();
+  badge.dataset.kind = cfg.source;
+}
+
+function setupSettings() {
+  const fitPrice = $('#fit-price-on-symbol');
+  fitPrice.checked = localStorage.getItem('kis.fitPriceOnSymbol') !== 'false';
+  fitPrice.onchange = () => localStorage.setItem('kis.fitPriceOnSymbol', String(fitPrice.checked));
+  const tablist = $('#view-tabs');
+  const tabs = [...tablist.querySelectorAll('[role="tab"]')];
+  for (const tab of tabs) {
+    tab.addEventListener('click', () => {
+      for (const item of tabs) {
+        const active = item === tab;
+        const panel = document.getElementById(item.getAttribute('aria-controls'));
+        item.setAttribute('aria-selected', String(active));
+        item.tabIndex = active ? 0 : -1;
+        panel.hidden = !active;
+        if (active && tablist.hidden) panel.focus({ preventScroll: true });
+      }
+    });
+    tab.addEventListener('keydown', (event) => {
+      let next;
+      if (event.key === 'Home') next = tabs[0];
+      else if (event.key === 'End') next = tabs[tabs.length - 1];
+      else if (['ArrowLeft', 'ArrowRight'].includes(event.key)) next = tabs.find(item => item !== tab);
+      else return;
+      event.preventDefault();
+      next.click();
+      next.focus();
+    });
+  }
+  const select = $('#domestic-market');
+  const status = $('#market-status');
+  select.addEventListener('change', async () => {
+    select.disabled = true;
+    status.dataset.kind = '';
+    status.textContent = '저장 중…';
+    try {
+      const { market } = await api('/api/settings/market', {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ market: select.value }),
+      });
+      state.config.market = market;
+      updateSourceBadge();
+      status.textContent = '저장됨';
+      if (state.config.source === 'kis' && DOMESTIC_RE.test(state.code)) {
+        replay.stop(false);
+        paintLive();
+        const code = state.code, tf = state.tf;
+        await loadCandles({ keepRange: true });
+        if (state.code === code && state.tf === tf) followQuotes();
+      }
+    } catch (error) {
+      select.value = state.config.market;
+      status.dataset.kind = 'error';
+      status.textContent = error.message;
+    } finally {
+      select.disabled = false;
+    }
+  });
 }
 
 async function init() {
-  buildToolbar();
   try {
-    const cfg = await api('/api/config');
-    const badge = $('#source');
-    badge.textContent = cfg.source === 'kis' ? `KIS ${cfg.env === 'real' ? '실전' : '모의'} · ${cfg.market}` : 'MOCK 데이터';
-    badge.dataset.kind = cfg.source;
-  } catch (e) { /* 서버 미실행 */ }
-  document.querySelectorAll('#tfs button').forEach((b) => b.classList.toggle('on', b.dataset.tf === state.tf));
-  chart.applyOptions({ timeScale: { timeVisible: isMinuteTf(state.tf) } });
+    const saved = JSON.parse(localStorage.getItem(savedYahooKey) || 'null');
+    if (saved?.code === state.code && isYahoo(saved.code) && typeof saved.name === 'string') learnNames([saved]);
+  } catch { /* 저장된 메타데이터가 없어도 서버에서 다시 조회합니다. */ }
+  $('#show-license').addEventListener('click', () => $('#license').showModal());
+  setupDateJump();
+  $('#history-retry').addEventListener('click', () => { older.error = ''; loadOlderBars(); });
+  $('#index-daily').addEventListener('click', () => switchTf('D'));
+  buildToolbar();
+  setupSettings();
+  try {
+    state.config = await api('/api/config');
+    state.quoteTransport = state.config.quote_transport;
+    $('#view-tabs').hidden = !!state.config.desktop;
+    $('#domestic-market').value = state.config.market;
+    $('#domestic-market').disabled = false;
+  } catch (e) {
+    $('#market-status').textContent = '거래소 설정을 불러오지 못했습니다.';
+  }
   await switchCode(parseCode(state.code) || '005930');
 }
 
-window.__app = { state, chart, candles, drawings, timeMap }; // 디버깅용
+window.__app = { state, chart, candles, drawings, timeMap, chartTypes, studies, indicatorLibrary, replay };
 init();

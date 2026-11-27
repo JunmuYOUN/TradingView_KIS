@@ -9,6 +9,7 @@ import calendar
 from datetime import datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 MINUTE_TFS = {"1": 1, "3": 3, "5": 5, "15": 15, "30": 30, "60": 60}
 PERIOD_TFS = {"D", "W", "M"}
@@ -27,7 +28,7 @@ def kst_epoch(yyyymmdd: str, hhmmss: str = "000000") -> int:
 
 
 def epoch_to_kst_parts(t: int) -> tuple[str, str]:
-    d = datetime.fromtimestamp(t, tz=timezone.utc)
+    d = _EPOCH + timedelta(seconds=t)
     return d.strftime("%Y%m%d"), d.strftime("%H%M%S")
 
 
@@ -44,7 +45,7 @@ def bucket_start(t: int, tf: str) -> int:
     day = t - (t % 86400)
     if tf == "D":
         return day
-    d = datetime.fromtimestamp(day, tz=timezone.utc)
+    d = _EPOCH + timedelta(seconds=day)
     if tf == "W":
         return day - d.weekday() * 86400  # 월요일
     if tf == "M":

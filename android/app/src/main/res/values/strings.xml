@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">KIS TradingView</string>
+
+    <string name="starting">차트를 준비하는 중…</string>
+    <string name="start_failed">차트를 열지 못했습니다.</string>
+    <string name="retry">다시 시도</string>
+
+    <string name="account_login">한투 API 로그인</string>
+    <string name="account_logout">로그아웃</string>
+    <string name="account_about">앱 정보</string>
+    <string name="status_kis_real">한투 실전 계정으로 연결됨</string>
+    <string name="status_kis_demo">한투 모의 계정으로 연결됨</string>
+    <string name="status_mock">연결 안 됨 · MOCK(가짜 시세)</string>
+
+    <string name="login_title">한투 API 로그인</string>
+    <string name="login_intro">KIS Developers에서 발급받은 키를 입력하세요.</string>
+    <string name="login_saved_hint">저장된 키를 다시 쓰려면 두 입력칸을 비워 두세요.</string>
+    <string name="login_app_key">App Key</string>
+    <string name="login_app_secret">App Secret</string>
+    <string name="login_storage_note">키와 토큰은 이 기기의 Android Keystore로 암호화해 저장합니다.</string>
+    <string name="login_checking">한투 API 인증을 확인하고 있습니다…</string>
+    <string name="login_submit">로그인</string>
+    <string name="login_failed">연결을 완료하지 못했습니다. 잠시 후 다시 시도하세요.</string>
+
+    <string name="logout_title">로그아웃할까요?</string>
+    <string name="logout_message">저장한 키와 토큰을 지우고 MOCK(가짜 시세) 차트로 돌아갑니다.</string>
+    <string name="logout_failed">로그아웃을 완료하지 못했습니다. 다시 시도하세요.</string>
+
+    <string name="about_message">버전 %1$s\n데스크톱 코드 %2$s\n\n데스크톱 앱과 같은 차트 서버와 화면을 이 기기 안에서 실행합니다.</string>
+
+    <string name="alert_title">가격 얼러트</string>
+    <string name="channel_alert_vibrate">가격 얼러트 (진동)</string>
+    <string name="channel_alert_quiet">가격 얼러트 (진동 없음)</string>
+    <string name="channel_watch">얼러트 감시 중 표시</string>
+    <string name="watch_title">얼러트 %1$d개 감시 중</string>
+    <string name="watch_text">열어 둔 종목의 얼러트를 확인하고 있습니다. 앱을 닫으면 멈춥니다.</string>
+    <string name="notifications_denied">알림 권한이 없어 얼러트를 앱 화면 안에서만 표시합니다. 설정 → 얼러트 알림에서 켤 수 있습니다.</string>
+
+    <string name="cancel">취소</string>
+    <string name="close">닫기</string>
+</resources>

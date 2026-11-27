@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 데스크톱 아이콘(web/mint-candles.ico)과 같은 민트색 캔들 세 개 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#45F9B0"
+        android:pathData="M32.6,56.4h3.2v5.2h6.4v13.2h-6.4v5.5h-3.2v-5.5h-6.6v-13.2h6.6z" />
+    <path
+        android:fillColor="#45F9B0"
+        android:pathData="M52.4,43h3.2v5.3h6.5v20.2h-6.5v5.4h-3.2v-5.4h-6.5v-20.2h6.5z" />
+    <path
+        android:fillColor="#45F9B0"
+        android:pathData="M72.3,27.7h3.2v6.3h6.5v27.2h-6.5v5.6h-3.2v-5.6h-6.5v-27.2h6.5z" />
+</vector>
