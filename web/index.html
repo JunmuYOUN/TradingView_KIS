@@ -9,8 +9,11 @@
 </head>
 <body>
   <header id="top">
-    <input id="symbol" list="symbols" placeholder="종목코드 또는 종목명" autocomplete="off" spellcheck="false">
-    <datalist id="symbols"></datalist>
+    <div id="search">
+      <input id="symbol" placeholder="종목명·코드 검색 (초성 가능)" autocomplete="off" spellcheck="false" maxlength="40"
+             role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="suggest">
+      <div id="suggest" role="listbox" hidden></div>
+    </div>
     <div id="tfs" class="group"></div>
     <span id="source" class="badge">…</span>
     <span id="live" class="badge live" data-kind="off"><i></i><span id="live-text">연결 중</span></span>

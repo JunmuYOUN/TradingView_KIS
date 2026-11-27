@@ -59,6 +59,7 @@ class Settings:
     host: str
     port: int
     rate_per_sec: float
+    symbol_download: bool = True  # 종목 검색용 마스터 파일을 한국투자증권에서 받을지
 
     @property
     def rest_base(self) -> str:
@@ -116,4 +117,5 @@ def load_settings(overrides: Mapping[str, str] | None = None) -> Settings:
         host=get("HOST", "127.0.0.1"),
         port=int(get("PORT", "8000")),
         rate_per_sec=max(0.5, rate),
+        symbol_download=get("SYMBOL_DOWNLOAD", "auto").strip().lower() not in ("off", "0", "false", "no"),
     )

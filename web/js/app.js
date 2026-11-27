@@ -4,14 +4,6 @@ import { DrawingManager, TOOLS } from './drawings.js';
 
 const LC = window.LightweightCharts;
 
-// 자주 보는 종목 (이름으로 입력하면 코드로 바꿔 줍니다). 필요하면 자유롭게 추가하세요.
-const SYMBOLS = {
-  삼성전자: '005930', SK하이닉스: '000660', LG에너지솔루션: '373220', 삼성바이오로직스: '207940',
-  현대차: '005380', 기아: '000270', 셀트리온: '068270', NAVER: '035420', 카카오: '035720',
-  POSCO홀딩스: '005490', KB금융: '105560', 삼성SDI: '006400', LG화학: '051910', 한화에어로스페이스: '012450',
-  KODEX200: '069500', 'KODEX 레버리지': '122630',
-};
-
 const UP = '#ef5350';   // 국내 관례: 상승 빨강
 const DOWN = '#2962ff'; // 하락 파랑
 
@@ -227,13 +219,6 @@ function buildToolbar() {
     b.onclick = () => drawings.setTool(id);
     toolBox.appendChild(b);
   }
-  const dl = $('#symbols');
-  for (const [name, code] of Object.entries(SYMBOLS)) {
-    const o = document.createElement('option');
-    o.value = `${name} ${code}`;
-    dl.appendChild(o);
-  }
-
   $('#magnet').checked = drawings.magnet;
   $('#magnet').onchange = (e) => drawings.setMagnet(e.target.checked);
   $('#undo').onclick = () => drawings.undo();
@@ -245,13 +230,7 @@ function buildToolbar() {
   $('#width').onchange = (e) => drawings.setSelectedStyle({ width: Number(e.target.value) });
   $('#extend').onchange = (e) => drawings.setSelectedStyle({ extend: e.target.checked });
 
-  $('#symbol').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      switchCode(e.target.value);
-      e.target.blur();
-    }
-  });
-  $('#symbol').addEventListener('change', (e) => switchCode(e.target.value));
+  setupSearch();
 
   drawings.onToolChange = (tool) => {
     document.querySelectorAll('#tools button').forEach((b) => b.classList.toggle('on', b.dataset.tool === tool));
@@ -268,29 +247,277 @@ function buildToolbar() {
   drawings.onSelect(null);
 }
 
+// ------------------------------------------------------------ 종목 검색 · 검색 기록
+const CODE_RE = /^(?=.*\d)[0-9A-Z]{6}$/;
+const names = new Map(); // 종목코드 -> 종목명 (검색 결과·기록·서버 조회에서 알게 된 이름)
+const symbolInput = $('#symbol');
+const suggest = $('#suggest');
+const search = { mode: 'closed', list: [], active: -1, query: '', emptyText: '', seq: 0, timer: null, history: [] };
+
+// "삼성전자 005930" 이나 "005930" 에서 코드를 꺼냅니다 (KRX 코드에는 숫자가 들어 있습니다)
 function parseCode(text) {
-  const s = String(text || '').trim();
-  const m = s.match(/\b([0-9A-Z]{6})\b/i);
-  if (m) return m[1].toUpperCase();
-  const hit = Object.entries(SYMBOLS).find(([name]) => name.toLowerCase() === s.toLowerCase());
-  return hit ? hit[1] : null;
+  const parts = String(text || '').trim().toUpperCase().split(/\s+/);
+  const last = parts[parts.length - 1] || '';
+  return CODE_RE.test(last) ? last : null;
 }
 
-function nameOf(code) {
-  const hit = Object.entries(SYMBOLS).find(([, c]) => c === code);
-  return hit ? hit[0] : '';
+function symbolLabel(code) {
+  return `${names.get(code) || ''} ${code}`.trim();
 }
 
-async function switchCode(text) {
-  const code = parseCode(text);
-  if (!code) {
-    setStatus('error', '종목코드 6자리 또는 목록의 종목명을 입력하세요');
+function showSymbol(code) {
+  if (document.activeElement !== symbolInput) symbolInput.value = symbolLabel(code);
+  document.title = `${names.get(code) || code} · KIS Tradingview`;
+}
+
+function learnNames(items) {
+  for (const it of items) if (it.name) names.set(it.code, it.name);
+}
+
+async function lookupName(code) {
+  try {
+    const s = await api(`/api/symbols/${code}`);
+    if (s.name) names.set(code, s.name);
+    if (state.code === code) showSymbol(code);
+  } catch (e) { /* 이름을 몰라도 코드로 볼 수 있습니다 */ }
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+// 종목명은 외부 파일에서 온 값이므로 textContent 로만 넣습니다. 검색어와 같은 부분은 강조합니다.
+function nameCell(name, query) {
+  const span = el('span', 'sg-name');
+  const q = query.trim().toLowerCase();
+  const i = q ? name.toLowerCase().indexOf(q) : -1;
+  if (i < 0) span.textContent = name;
+  else span.append(name.slice(0, i), el('mark', '', name.slice(i, i + q.length)), name.slice(i + q.length));
+  return span;
+}
+
+function closeSuggest() {
+  search.mode = 'closed';
+  search.list = [];
+  search.active = -1;
+  suggest.hidden = true;
+  suggest.replaceChildren();
+  symbolInput.setAttribute('aria-expanded', 'false');
+}
+
+function markActive(scroll) {
+  suggest.querySelectorAll('.sg-item').forEach((row, i) => {
+    const on = i === search.active;
+    row.classList.toggle('on', on);
+    row.setAttribute('aria-selected', String(on));
+    if (on && scroll) row.scrollIntoView({ block: 'nearest' });
+  });
+}
+
+function renderSuggest() {
+  const isHistory = search.mode === 'history';
+  suggest.replaceChildren();
+  if (isHistory) {
+    const head = el('div', 'sg-head');
+    head.append(el('span', '', '최근 검색'));
+    if (search.list.length) {
+      const clear = el('button', 'sg-clear', '전체 삭제');
+      clear.type = 'button';
+      clear.onclick = clearHistory;
+      head.append(clear);
+    }
+    suggest.append(head);
+  }
+  if (!search.list.length) {
+    suggest.append(el('div', 'sg-empty', isHistory ? '검색 기록이 없습니다. 종목명 일부나 코드를 입력하세요.' : search.emptyText));
+  }
+  search.list.forEach((item, i) => {
+    const row = el('div', 'sg-item');
+    row.setAttribute('role', 'option');
+    row.append(nameCell(item.name || '이름 모름', isHistory ? '' : search.query), el('span', 'sg-code', item.code),
+      el('span', 'sg-kind', item.kind && item.kind !== '주식' ? item.kind : item.market || ''));
+    if (isHistory) {
+      const del = el('button', 'sg-del', '×');
+      del.type = 'button';
+      del.title = '검색 기록에서 지우기';
+      del.onclick = (e) => {
+        e.stopPropagation();
+        removeHistory(item.code);
+      };
+      row.append(del);
+    }
+    row.onclick = () => choose(item);
+    row.onmousemove = () => {
+      if (search.active !== i) {
+        search.active = i;
+        markActive(false);
+      }
+    };
+    suggest.append(row);
+  });
+  markActive(true);
+  suggest.hidden = false;
+  symbolInput.setAttribute('aria-expanded', 'true');
+}
+
+async function openHistory() {
+  search.seq++; // 늦게 도착하는 검색 결과는 버립니다
+  search.mode = 'history';
+  search.list = search.history;
+  search.active = -1;
+  renderSuggest();
+  try {
+    const { items } = await api('/api/history');
+    search.history = items;
+    learnNames(items);
+    if (search.mode === 'history') {
+      search.list = items;
+      renderSuggest();
+    }
+  } catch (e) { /* 기록을 못 읽어도 검색은 됩니다 */ }
+}
+
+async function runSearch(q) {
+  const seq = ++search.seq;
+  let items = [];
+  let emptyText = '일치하는 종목이 없습니다';
+  try {
+    const res = await api(`/api/symbols?q=${encodeURIComponent(q)}&limit=20`);
+    items = res.items;
+    if (!res.ready) emptyText = '전체 종목 목록을 아직 받지 못해 일부 종목만 찾을 수 있습니다';
+  } catch (e) {
+    emptyText = `검색 실패: ${e.message}`;
+  }
+  if (seq !== search.seq || document.activeElement !== symbolInput) return;
+  learnNames(items);
+  Object.assign(search, { mode: 'results', list: items, active: items.length ? 0 : -1, query: q, emptyText });
+  renderSuggest();
+}
+
+function refreshSuggest() {
+  clearTimeout(search.timer);
+  const q = symbolInput.value.trim();
+  if (!q || q === symbolLabel(state.code)) openHistory();
+  else search.timer = setTimeout(() => runSearch(q), 120);
+}
+
+async function submitSearch() {
+  clearTimeout(search.timer);
+  const text = symbolInput.value.trim();
+  const shown = search.mode === 'history' || (search.mode === 'results' && search.query === text);
+  if (shown && search.active >= 0) return choose(search.list[search.active]);
+  if (!text || text === symbolLabel(state.code)) {
+    closeSuggest();
+    symbolInput.blur();
     return;
   }
+  const code = parseCode(text);
+  if (code) return choose({ code, name: names.get(code) || '' });
+  await runSearch(text); // 결과가 오기 전에 Enter 를 누른 경우: 첫 번째 결과로 엽니다
+  if (search.query === text && search.list.length) choose(search.list[0]);
+}
+
+function choose(item) {
+  clearTimeout(search.timer);
+  closeSuggest();
+  symbolInput.blur();
+  switchCode(item.code, { name: item.name, record: true });
+}
+
+async function addHistory(code, name) {
+  try {
+    const { items } = await api('/api/history', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, name }),
+    });
+    search.history = items;
+    learnNames(items);
+  } catch (e) { /* 기록을 못 남겨도 차트는 그대로 봅니다 */ }
+}
+
+async function removeHistory(code) {
+  try {
+    const { items } = await api(`/api/history/${code}`, { method: 'DELETE' });
+    search.history = items;
+  } catch (e) {
+    return;
+  }
+  if (search.mode === 'history') {
+    search.list = search.history;
+    search.active = Math.min(search.active, search.list.length - 1);
+    renderSuggest();
+  }
+}
+
+async function clearHistory() {
+  if (!confirm('검색 기록을 모두 지울까요?')) return;
+  try {
+    const { items } = await api('/api/history', { method: 'DELETE' });
+    search.history = items;
+  } catch (e) {
+    return;
+  }
+  if (search.mode === 'history') {
+    search.list = [];
+    search.active = -1;
+    renderSuggest();
+  }
+}
+
+function setupSearch() {
+  let selectOnMouseUp = false;
+  symbolInput.addEventListener('mousedown', () => {
+    selectOnMouseUp = document.activeElement !== symbolInput;
+  });
+  symbolInput.addEventListener('mouseup', (e) => {
+    if (selectOnMouseUp) e.preventDefault(); // 클릭으로 들어왔을 때 전체 선택이 풀리지 않게
+    selectOnMouseUp = false;
+  });
+  symbolInput.addEventListener('focus', () => {
+    symbolInput.select();
+    openHistory();
+  });
+  symbolInput.addEventListener('input', refreshSuggest);
+  symbolInput.addEventListener('keydown', (e) => {
+    if (e.isComposing) return; // 한글 조합 중인 Enter·방향키는 입력기에 맡깁니다
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (search.mode === 'closed') return refreshSuggest();
+      const n = search.list.length;
+      if (!n) return;
+      search.active = e.key === 'ArrowDown' ? (search.active + 1) % n : (search.active - 1 + n) % n;
+      markActive(true);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      submitSearch();
+    } else if (e.key === 'Escape') {
+      closeSuggest();
+      symbolInput.blur();
+    }
+  });
+  symbolInput.addEventListener('blur', () => {
+    setTimeout(() => {
+      if (document.activeElement === symbolInput) return;
+      closeSuggest();
+      showSymbol(state.code);
+    }, 150);
+  });
+  suggest.addEventListener('mousedown', (e) => e.preventDefault()); // 목록을 눌러도 입력칸 포커스 유지
+}
+
+async function switchCode(code, { name = '', record = false } = {}) {
+  if (!CODE_RE.test(code || '')) {
+    setStatus('error', '종목명 일부나 6자리 종목코드를 입력해 목록에서 고르세요');
+    return;
+  }
+  if (name) names.set(code, name);
   state.code = code;
   localStorage.setItem('kis.code', code);
-  $('#symbol').value = `${nameOf(code)} ${code}`.trim();
-  document.title = `${nameOf(code) || code} · KIS Tradingview`;
+  showSymbol(code);
+  if (!names.has(code)) lookupName(code);
+  if (record) addHistory(code, names.get(code) || '');
   await Promise.all([loadCandles(), loadDrawings()]);
   connectWs();
 }
@@ -313,7 +540,7 @@ async function init() {
   } catch (e) { /* 서버 미실행 */ }
   document.querySelectorAll('#tfs button').forEach((b) => b.classList.toggle('on', b.dataset.tf === state.tf));
   chart.applyOptions({ timeScale: { timeVisible: isMinuteTf(state.tf) } });
-  await switchCode(state.code);
+  await switchCode(parseCode(state.code) || '005930');
 }
 
 window.__app = { state, chart, candles, drawings, timeMap }; // 디버깅용

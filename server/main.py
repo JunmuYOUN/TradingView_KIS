@@ -19,8 +19,10 @@ from fastapi.staticfiles import StaticFiles
 from .bars import MINUTE_TFS, PERIOD_TFS, aggregate
 from .config import DATA_DIR, WEB_DIR, Settings, load_settings, remove_legacy_plaintext
 from .guard import LocalGuard
+from .history import SearchHistory
 from .kis_source import KisError
 from .mock_source import MockSource
+from .symbols import SymbolBook, clean_name
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
@@ -50,10 +52,16 @@ async def lifespan(app: FastAPI):
     app.state.source = make_source(settings)
     app.state.event_loop = asyncio.get_running_loop()
     app.state.ws_clients = 0
+    app.state.history = SearchHistory(DATA_DIR / "search_history.json")
+    app.state.symbols = SymbolBook(DATA_DIR / "symbols.json", download=settings.symbol_download)
+    for item in app.state.history.load():  # 종목 목록을 못 받아도 예전에 찾은 종목은 이름으로 찾을 수 있게
+        app.state.symbols.remember(item["code"], item["name"])
+    app.state.symbols.refresh_if_stale()  # 종목 마스터는 백그라운드에서 받습니다
     log.info("데이터 소스: %s (env=%s, market=%s)", app.state.source.name, settings.env, settings.market)
     if browser_url := getattr(app.state, "browser_url", None):
         asyncio.get_running_loop().call_later(1.0, webbrowser.open, browser_url)
     yield
+    await app.state.symbols.close()
     await app.state.source.close()
 
 
@@ -80,6 +88,64 @@ async def api_config(request: Request):
     settings = request.app.state.settings
     return {"source": settings.source, "env": settings.env, "market": settings.market,
             "ws_tr_id": settings.ws_tr_id if settings.source == "kis" else None}
+
+
+async def json_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(400, "JSON 본문이 필요합니다") from None
+    if not isinstance(body, dict):
+        raise HTTPException(400, "JSON 객체가 필요합니다")
+    return body
+
+
+@app.get("/api/symbols")
+async def api_symbols(q: str = Query("", max_length=40), limit: int = Query(20, ge=1, le=50)):
+    """종목명 일부, 코드 앞자리, 초성(ㅅㅅㅈㅈ)으로 종목을 찾습니다."""
+    book = app.state.symbols
+    await book.wait_ready(5.0)  # 처음 실행해서 종목 목록을 받는 중이면 잠시 기다립니다
+    recent = {it["code"] for it in app.state.history.load()}  # 전에 찾아본 종목을 앞에 둡니다
+    return {"items": [s.as_dict() for s in book.search(q, limit, recent)], "ready": book.ready}
+
+
+@app.get("/api/symbols/{code}")
+async def api_symbol(code: str):
+    code = check_code(code)
+    book = app.state.symbols
+    await book.wait_ready(3.0)
+    s = book.get(code)
+    return s.as_dict() if s else {"code": code, "name": "", "market": "", "kind": ""}
+
+
+@app.get("/api/history")
+async def get_history():
+    book = app.state.symbols
+    items = app.state.history.load()
+    for it in items:  # 저장할 때 이름을 몰랐던 종목은 지금 목록에서 채웁니다
+        if not it["name"] and (s := book.get(it["code"])):
+            it["name"] = s.name
+    return {"items": items}
+
+
+@app.post("/api/history")
+async def add_history(request: Request):
+    body = await json_body(request)
+    code = check_code(str(body.get("code", "")))
+    s = app.state.symbols.get(code)
+    name = s.name if s else clean_name(body.get("name", ""))
+    app.state.symbols.remember(code, name)
+    return {"items": app.state.history.add(code, name)}
+
+
+@app.delete("/api/history/{code}")
+async def delete_history(code: str):
+    return {"items": app.state.history.remove(check_code(code))}
+
+
+@app.delete("/api/history")
+async def clear_history():
+    return {"items": app.state.history.clear()}
 
 
 @app.get("/api/candles")
