@@ -1,10 +1,12 @@
 # 비밀 키
 .env
+.env.*.tmp
 
 # 파이썬
 .venv/
 __pycache__/
 *.pyc
+TradingView.exe
 
 # 실행 중 생기는 파일 (토큰 캐시, 분봉 캐시, 그린 선)
 data/*

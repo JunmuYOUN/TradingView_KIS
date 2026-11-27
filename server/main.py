@@ -17,22 +17,25 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .bars import MINUTE_TFS, PERIOD_TFS, aggregate
-from .config import DATA_DIR, WEB_DIR, load_settings
+from .config import DATA_DIR, WEB_DIR, Settings, load_settings, remove_legacy_plaintext
+from .guard import LocalGuard
+from .kis_source import KisError
 from .mock_source import MockSource
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
 
-settings = load_settings()
 CODE_RE = re.compile(r"^[0-9A-Z]{6}$")
 DRAW_DIR = DATA_DIR / "drawings"
+MAX_WS_CLIENTS = 16          # 동시에 붙을 수 있는 실시간 웹소켓 수
+WS_CLIENT_MAX_MESSAGE = 4096  # 화면은 웹소켓으로 거의 보내는 것이 없으므로 작게 제한합니다
 
 # 분봉 타임프레임별 기본 조회 일수 (KIS 호출 수를 줄이기 위해 짧게 잡았습니다)
 DEFAULT_DAYS = {"1": 1, "3": 2, "5": 3, "15": 5, "30": 8, "60": 15}
 DEFAULT_COUNT = {"D": 400, "W": 300, "M": 200}
 
 
-def make_source():
+def make_source(settings: Settings):
     if settings.source == "kis":
         from .kis_source import KisSource
         return KisSource(settings)
@@ -41,12 +44,15 @@ def make_source():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.source = make_source()
+    remove_legacy_plaintext()  # 이전 버전이 평문으로 남긴 토큰 캐시를 지웁니다
+    settings = getattr(app.state, "initial_settings", None) or load_settings()
+    app.state.settings = settings
+    app.state.source = make_source(settings)
+    app.state.event_loop = asyncio.get_running_loop()
+    app.state.ws_clients = 0
     log.info("데이터 소스: %s (env=%s, market=%s)", app.state.source.name, settings.env, settings.market)
-    url = f"http://{settings.host}:{settings.port}"
-    log.info("브라우저에서 %s 를 여세요", url)
-    if os.getenv("OPEN_BROWSER") == "1":
-        asyncio.get_running_loop().call_later(1.0, webbrowser.open, url)
+    if browser_url := getattr(app.state, "browser_url", None):
+        asyncio.get_running_loop().call_later(1.0, webbrowser.open, browser_url)
     yield
     await app.state.source.close()
 
@@ -64,11 +70,14 @@ def check_code(code: str) -> str:
 @app.exception_handler(Exception)
 async def on_error(request: Request, exc: Exception):
     log.exception("요청 처리 실패: %s", request.url.path)
-    return JSONResponse({"detail": str(exc)}, status_code=502)
+    # KIS 오류 메시지만 화면에 보여 주고, 그 밖의 내부 오류 내용은 로그에만 남깁니다
+    detail = str(exc) if isinstance(exc, KisError) else "데이터를 불러오지 못했습니다. 잠시 후 다시 시도하세요."
+    return JSONResponse({"detail": detail}, status_code=502)
 
 
 @app.get("/api/config")
-async def api_config():
+async def api_config(request: Request):
+    settings = request.app.state.settings
     return {"source": settings.source, "env": settings.env, "market": settings.market,
             "ws_tr_id": settings.ws_tr_id if settings.source == "kis" else None}
 
@@ -117,6 +126,9 @@ async def put_drawings(code: str, request: Request):
 
 @app.websocket("/ws/ticks")
 async def ws_ticks(ws: WebSocket, code: str):
+    if app.state.ws_clients >= MAX_WS_CLIENTS:
+        await ws.close(code=1013)  # 잠시 후 다시 시도
+        return
     await ws.accept()
     try:
         code = check_code(code)
@@ -124,8 +136,13 @@ async def ws_ticks(ws: WebSocket, code: str):
         await ws.send_json({"type": "status", "state": "error", "msg": e.detail})
         await ws.close()
         return
+    app.state.ws_clients += 1
     hub = app.state.source.hub
-    q = await hub.subscribe(code)
+    try:
+        q = await hub.subscribe(code)
+    except BaseException:
+        app.state.ws_clients -= 1
+        raise
 
     async def pump():
         while True:
@@ -142,6 +159,7 @@ async def ws_ticks(ws: WebSocket, code: str):
     except WebSocketDisconnect:
         pass
     finally:
+        app.state.ws_clients -= 1
         for t in tasks:
             t.cancel()
         await hub.unsubscribe(code, q)
@@ -157,7 +175,15 @@ app.mount("/", StaticFiles(directory=WEB_DIR), name="web")
 
 def main() -> None:
     import uvicorn
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
+    settings = load_settings()
+    app.state.initial_settings = settings
+    url = f"http://{settings.host}:{settings.port}"
+    log.info("브라우저에서 %s 를 여세요", url)
+    if os.getenv("OPEN_BROWSER") == "1":
+        app.state.browser_url = url
+    guarded = LocalGuard(app, host=settings.host, port=settings.port)
+    uvicorn.run(guarded, host=settings.host, port=settings.port, log_level="info",
+                ws_max_size=WS_CLIENT_MAX_MESSAGE)
 
 
 if __name__ == "__main__":

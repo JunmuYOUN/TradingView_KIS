@@ -11,14 +11,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import random
+import re
 import time
+from contextlib import suppress
 from datetime import datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 
 import httpx
 import websockets
 
-from .bars import dedupe_sort, epoch_to_kst_parts as _parts, kst_epoch, now_kst
+from . import vault
+from .bars import dedupe_sort, epoch_to_kst_parts as _parts, kst_epoch, now_epoch, now_kst
 from .config import DATA_DIR, Settings
 from .hub import TickHub
 
@@ -26,6 +32,12 @@ log = logging.getLogger("kis")
 
 QUOTE = "/uapi/domestic-stock/v1/quotations"
 MAX_WS_CODES = 40
+APPROVAL_TTL = 20 * 3600     # 웹소켓 접속키 재사용 시간 (유효기간 24시간)
+APPROVAL_MIN_REISSUE = 60    # 접속키 강제 재발급 최소 간격 (초)
+WS_MAX_FRAME = 256 * 1024    # KIS 실시간 메시지 최대 크기
+WS_MAX_RECORDS = 100         # 메시지 1개에 담긴 체결 건수 상한
+HHMMSS_RE = re.compile(r"^([01]\d|2[0-3])[0-5]\d[0-5]\d$")
+DATE_RE = re.compile(r"^20\d{6}$")
 
 
 class KisError(RuntimeError):
@@ -36,9 +48,23 @@ class KisError(RuntimeError):
 
 def _num(s) -> float:
     try:
-        return float(s)
+        v = float(s)
     except (TypeError, ValueError):
         return 0.0
+    return v if math.isfinite(v) else 0.0  # "nan"/"inf" 는 JSON 으로 보낼 수 없습니다
+
+
+def _json(r: httpx.Response) -> dict:
+    try:
+        body = r.json()
+    except ValueError:
+        raise KisError(str(r.status_code), "KIS 서버 응답을 해석할 수 없습니다") from None
+    return body if isinstance(body, dict) else {}
+
+
+def _clean(text, limit: int = 120) -> str:
+    """KIS 메시지를 화면에 보내기 전에 제어 문자를 지우고 길이를 줄입니다."""
+    return "".join(ch for ch in str(text) if ch.isprintable())[:limit]
 
 
 def _minus_one_minute(yyyymmdd: str, hhmmss: str) -> tuple[str, str]:
@@ -48,33 +74,36 @@ def _minus_one_minute(yyyymmdd: str, hhmmss: str) -> tuple[str, str]:
 
 # ---------------------------------------------------------------- 인증
 class KisAuth:
-    """접근토큰(REST)과 웹소켓 접속키를 파일에 캐시해서 재사용합니다.
+    """접근토큰(REST)과 웹소켓 접속키를 암호화 파일(Windows DPAPI)에 캐시해서 재사용합니다.
 
     접근토큰은 유효기간 1일, 발급은 1분에 1회로 제한되므로 매번 새로 받으면 안 됩니다.
+    Windows 가 아니면 디스크에 남기지 않고 메모리에만 둡니다.
     """
 
     def __init__(self, s: Settings, client: httpx.AsyncClient) -> None:
         self.s = s
         self.client = client
         self._lock = asyncio.Lock()
-        self._token_file = DATA_DIR / f"kis_token_{s.env}.json"
-        self._approval_file = DATA_DIR / f"kis_approval_{s.env}.json"
+        self._approval_lock = asyncio.Lock()
+        credentials = json.dumps([s.app_key, s.app_secret]).encode("utf-8")
+        self._credential_id = sha256(credentials).hexdigest()
+        self._token_file = DATA_DIR / f"kis_token_{s.env}.bin"
+        self._approval_file = DATA_DIR / f"kis_approval_{s.env}.bin"
         self._token: str | None = None
         self._token_exp: float = 0.0
+        self._approval: str | None = None
+        self._approval_at: float = 0.0
 
     def _load(self, p: Path) -> dict:
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-            if d.get("app_key_tail") == self.s.app_key[-6:]:
-                return d
-        except Exception:
-            pass
-        return {}
+        d = vault.load(p) or {}
+        return d if d.get("credential_id") == self._credential_id else {}
 
     def _save(self, p: Path, d: dict) -> None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        d["app_key_tail"] = self.s.app_key[-6:]
-        p.write_text(json.dumps(d), encoding="utf-8")
+        d["credential_id"] = self._credential_id
+        try:
+            vault.save(p, d)
+        except OSError as e:
+            log.warning("인증 캐시를 암호화해 저장하지 못했습니다 (%s), 이번 실행에서만 사용합니다", type(e).__name__)
 
     async def token(self, force: bool = False) -> str:
         async with self._lock:
@@ -91,10 +120,10 @@ class KisAuth:
                 json={"grant_type": "client_credentials",
                       "appkey": self.s.app_key, "appsecret": self.s.app_secret},
             )
-            body = r.json()
-            if r.status_code != 200 or "access_token" not in body:
-                raise KisError(body.get("error_code", str(r.status_code)),
-                               body.get("error_description", r.text[:200]))
+            body = _json(r)
+            if r.status_code != 200 or not isinstance(body.get("access_token"), str):
+                raise KisError(_clean(body.get("error_code") or r.status_code, 20),
+                               _clean(body.get("error_description") or "접근토큰 발급 실패"))
             exp_str = body.get("access_token_token_expired")  # "2026-11-26 21:00:00" (KST)
             try:
                 exp = datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S").replace(
@@ -107,27 +136,39 @@ class KisAuth:
             return self._token
 
     async def approval_key(self, force: bool = False) -> str:
-        d = {} if force else self._load(self._approval_file)
-        if d.get("approval_key") and time.time() - d.get("issued_at", 0) < 20 * 3600:
-            return d["approval_key"]
-        r = await self.client.post(
-            f"{self.s.rest_base}/oauth2/Approval",
-            json={"grant_type": "client_credentials",
-                  "appkey": self.s.app_key, "secretkey": self.s.app_secret},  # secretkey 주의
-        )
-        body = r.json()
-        if r.status_code != 200 or "approval_key" not in body:
-            raise KisError(str(r.status_code), r.text[:200])
-        self._save(self._approval_file, {"approval_key": body["approval_key"], "issued_at": time.time()})
-        log.info("KIS 웹소켓 접속키 발급 완료")
-        return body["approval_key"]
+        async with self._approval_lock:
+            now = time.time()
+            if force and now - self._approval_at < APPROVAL_MIN_REISSUE:
+                force = False  # 방금 받은 키입니다. 오류가 반복돼도 발급 요청을 몰아 보내지 않습니다
+            if not force:
+                if self._approval and now - self._approval_at < APPROVAL_TTL:
+                    return self._approval
+                d = self._load(self._approval_file)
+                issued = d.get("issued_at", 0)
+                if isinstance(d.get("approval_key"), str) and 0 <= now - issued < APPROVAL_TTL:
+                    self._approval, self._approval_at = d["approval_key"], issued
+                    return self._approval
+            r = await self.client.post(
+                f"{self.s.rest_base}/oauth2/Approval",
+                json={"grant_type": "client_credentials",
+                      "appkey": self.s.app_key, "secretkey": self.s.app_secret},  # secretkey 주의
+            )
+            body = _json(r)
+            if r.status_code != 200 or not isinstance(body.get("approval_key"), str):
+                raise KisError(_clean(body.get("error_code") or r.status_code, 20),
+                               _clean(body.get("error_description") or "웹소켓 접속키 발급 실패"))
+            self._approval, self._approval_at = body["approval_key"], now
+            self._save(self._approval_file, {"approval_key": self._approval, "issued_at": now})
+            log.info("KIS 웹소켓 접속키 발급 완료")
+            return self._approval
 
 
 # ---------------------------------------------------------------- REST
 class KisRest:
     def __init__(self, s: Settings) -> None:
         self.s = s
-        self.client = httpx.AsyncClient(timeout=15.0)
+        # 인증서 검증을 켜 두고, 키가 담긴 요청이 다른 주소로 따라가지 않도록 리다이렉트를 막습니다
+        self.client = httpx.AsyncClient(timeout=15.0, verify=True, follow_redirects=False)
         self.auth = KisAuth(s, self.client)
         self._interval = 1.0 / s.rate_per_sec
         self._next_slot = 0.0
@@ -154,13 +195,10 @@ class KisRest:
                 "custtype": "P",
             }
             r = await self.client.get(f"{self.s.rest_base}{path}", headers=headers, params=params)
-            try:
-                body = r.json()
-            except ValueError:
-                raise KisError(str(r.status_code), r.text[:200])
+            body = _json(r)
             if body.get("rt_cd") == "0":
                 return body
-            code, msg = body.get("msg_cd", str(r.status_code)), body.get("msg1", "")
+            code, msg = _clean(body.get("msg_cd") or r.status_code, 20), _clean(body.get("msg1", ""))
             if code == "EGW00201":            # 초당 거래건수 초과
                 await asyncio.sleep(1.0 + attempt)
                 continue
@@ -177,9 +215,14 @@ class KisRest:
 
 # ---------------------------------------------------------------- 실시간
 class KisRealtimeHub(TickHub):
-    """KIS 웹소켓 1개 연결을 유지하면서 구독 종목의 체결 틱을 나눠 줍니다."""
+    """KIS 웹소켓 1개 연결을 유지하면서 구독 종목의 체결 틱을 나눠 줍니다.
+
+    KIS 실시간 서버는 TLS(wss)를 지원하지 않아 이 구간은 암호화되지 않습니다. 그래서 받은
+    메시지를 그대로 믿지 않고 TR·종목·가격·시각을 검사한 뒤에만 화면으로 보냅니다.
+    """
 
     WATCHDOG_SEC = 75  # 이 시간 동안 아무 메시지(PINGPONG 포함)가 없으면 다시 접속
+    STABLE_SEC = 60    # 이만큼 연결이 유지돼야 재접속 대기 시간을 처음 값으로 되돌립니다
 
     def __init__(self, s: Settings, auth: KisAuth) -> None:
         super().__init__()
@@ -205,7 +248,7 @@ class KisRealtimeHub(TickHub):
             try:
                 await ws.send(self._msg(key, code, tr_type))
             except Exception as e:  # 연결이 끊긴 경우 재접속 루프가 다시 구독합니다
-                log.warning("구독 메시지 전송 실패: %s", e)
+                log.warning("구독 메시지 전송 실패 (%s)", type(e).__name__)
 
     async def on_first_subscribe(self, code: str) -> None:
         if len(self.codes) > MAX_WS_CODES:
@@ -223,61 +266,77 @@ class KisRealtimeHub(TickHub):
     def _handle_data(self, raw: str) -> None:
         # 형식: 0|H0STCNT0|003|필드^필드^...   (암호화 데이터는 1| 로 시작, 체결가는 암호화되지 않음)
         parts = raw.split("|", 3)
-        if len(parts) < 4 or parts[0] != "0":
-            return
+        if len(parts) < 4 or parts[0] != "0" or parts[1] != self.s.ws_tr_id:
+            return  # 구독하지 않은 TR 은 버립니다
         try:
-            n = max(1, int(parts[2]))
+            n = int(parts[2])
         except ValueError:
-            n = 1
+            return
+        if not 1 <= n <= WS_MAX_RECORDS:
+            return
         fields = parts[3].split("^")
         width = len(fields) // n
+        if width < 13:
+            return
         today = now_kst().strftime("%Y%m%d")
+        now = now_epoch()
+        subscribed = set(self.codes)
         for i in range(n):
             f = fields[i * width:(i + 1) * width]
-            if len(f) < 13:
-                continue
             code, hhmmss, price, vol = f[0], f[1], _num(f[2]), _num(f[12])
-            date = f[33] if len(f) > 33 and len(f[33]) == 8 else today  # BSOP_DATE
-            if price <= 0 or len(hhmmss) != 6:
+            if code not in subscribed or not HHMMSS_RE.match(hhmmss):
                 continue
-            self.publish(code, {"type": "tick", "t": kst_epoch(date, hhmmss), "p": price, "v": vol})
+            if not (0 < price < 1e8 and 0 <= vol < 1e12):
+                continue
+            date = f[33] if len(f) > 33 and DATE_RE.match(f[33]) else today  # BSOP_DATE
+            try:
+                t = kst_epoch(date, hhmmss)
+            except ValueError:
+                continue
+            if not now - 3 * 86400 <= t <= now + 3600:
+                continue  # 시각이 크게 어긋난 틱은 차트를 망가뜨리므로 버립니다
+            self.publish(code, {"type": "tick", "t": t, "p": price, "v": vol})
 
     async def _run(self) -> None:
         backoff = 1.0
         while self.codes:
+            opened_at = None
             try:
                 key = await self.auth.approval_key()
-                async with websockets.connect(self.s.ws_url, ping_interval=None,
-                                              open_timeout=10, max_size=2**22) as ws:
+                # compression=None: 압축 해제 폭탄을 막고, max_size 로 메시지 크기를 제한합니다
+                async with websockets.connect(self.s.ws_url, ping_interval=None, open_timeout=10,
+                                              max_size=WS_MAX_FRAME, compression=None) as ws:
+                    opened_at = time.monotonic()
                     self._ws = ws
-                    for c in self.codes:
+                    for c in self.codes[:MAX_WS_CODES]:
                         await ws.send(self._msg(key, c, "1"))
                     if self._connected_once:
                         self.publish_all({"type": "resync"})  # 끊긴 구간을 REST 로 다시 받도록 알림
                     self._connected_once = True
                     self.publish_all({"type": "status", "state": "live", "msg": f"KIS 실시간 ({self.s.ws_tr_id})"})
-                    backoff = 1.0
                     while self.codes:
                         raw = await asyncio.wait_for(ws.recv(), timeout=self.WATCHDOG_SEC)
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8", "replace")
-                        if raw and raw[0] in "01":
+                        if raw[:1] in ("0", "1"):
                             self._handle_data(raw)
                             continue
                         try:
                             d = json.loads(raw)
                         except ValueError:
                             continue
-                        tr_id = d.get("header", {}).get("tr_id")
-                        if tr_id == "PINGPONG":
+                        if not isinstance(d, dict):
+                            continue
+                        header = d.get("header") if isinstance(d.get("header"), dict) else {}
+                        if header.get("tr_id") == "PINGPONG":
                             await ws.pong(raw)  # 공식 예제와 같은 방식으로 응답
                             continue
-                        body = d.get("body") or {}
+                        body = d.get("body") if isinstance(d.get("body"), dict) else {}
                         if body.get("rt_cd") not in (None, "0"):
-                            msg = body.get("msg1", "")
+                            msg = _clean(body.get("msg1", ""))
                             log.warning("KIS 웹소켓 응답: %s", msg)
-                            code = d.get("header", {}).get("tr_key")
-                            if code:
+                            code = header.get("tr_key")
+                            if code in self.codes:
                                 self.publish(code, {"type": "status", "state": "error", "msg": msg})
                             if "approval" in msg.lower() or "appkey" in msg.lower():
                                 await self.auth.approval_key(force=True)
@@ -286,18 +345,24 @@ class KisRealtimeHub(TickHub):
             except asyncio.TimeoutError:
                 log.warning("KIS 웹소켓 %d초 동안 메시지 없음, 다시 접속합니다", self.WATCHDOG_SEC)
             except Exception as e:
-                log.warning("KIS 웹소켓 오류: %s", e)
-                self.publish_all({"type": "status", "state": "reconnecting", "msg": str(e)[:120]})
+                log.warning("KIS 웹소켓 오류 (%s: %s)", type(e).__name__, _clean(e, 200))
+                self.publish_all({"type": "status", "state": "reconnecting",
+                                  "msg": "KIS 실시간 연결이 끊겨 다시 접속합니다"})
             finally:
                 self._ws = None
             if not self.codes:
                 break
-            await asyncio.sleep(backoff)
+            if opened_at is not None and time.monotonic() - opened_at >= self.STABLE_SEC:
+                backoff = 1.0  # 접속하자마자 끊기는 경우에는 대기 시간을 계속 늘립니다
+            await asyncio.sleep(backoff * random.uniform(0.7, 1.3))
             backoff = min(backoff * 2, 30.0)
 
     async def close(self) -> None:
-        if self._task:
-            self._task.cancel()
+        task, self._task = self._task, None
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task  # 웹소켓이 닫힌 뒤에 HTTP 클라이언트를 닫습니다
 
 
 # ---------------------------------------------------------------- 데이터 소스

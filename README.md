@@ -10,7 +10,11 @@
 
 ### Windows
 
-`run.bat`을 더블클릭합니다. 처음 실행할 때 `.venv` 가상환경을 만들고 패키지를 설치하며, 이후에는 바로 서버가 켜지고 브라우저가 열립니다.
+**데스크톱 앱:** `TradingView.exe`를 더블클릭하면 차트가 독립된 창에서 열립니다. Microsoft Edge WebView2 런타임이 필요합니다. **설정 → 한투 API 연결**에서 KIS Developers의 App Key와 App Secret을 입력하고 투자 환경과 시장을 선택하세요. 인증이 끝나면 앱이 키를 암호화해 저장하고 차트를 새로 불러옵니다(아래 [키와 토큰 보관](#키와-토큰-보관)). 프로젝트 폴더에서 실행하면 `data/`에 저장한 선도 이어서 쓸 수 있습니다.
+
+실행 파일을 다시 만들려면 Python 3.10 이상으로 `python -m venv .venv`를 실행한 뒤 PowerShell에서 `./build-desktop.ps1`을 실행합니다.
+
+**브라우저:** `run.bat`을 더블클릭합니다. 처음 실행할 때 `.venv` 가상환경을 만들고 패키지를 설치하며, 이후에는 서버가 켜지고 브라우저가 열립니다.
 
 ### macOS / Linux
 
@@ -30,7 +34,7 @@ python -m server.main           # http://127.0.0.1:8000
 ## KIS 키 연결
 
 1. [KIS Developers](https://apiportal.koreainvestment.com)에서 API를 신청하고 App Key와 App Secret을 발급받습니다. 모의투자 키로도 시세를 받을 수 있습니다.
-2. `.env.example`을 `.env`로 복사하고 값을 채웁니다.
+2. Windows에서는 데스크톱 앱의 **설정 → 한투 API 연결**로 키를 넣는 방법을 권합니다. 키가 암호화되어 저장되고, `.env`에 키가 없으면 `run.bat`도 그 키를 씁니다. 다른 운영체제이거나 `.env`로 설정하려면 `.env.example`을 `.env`로 복사하고 값을 채웁니다. 이 경우 키는 `.env`에 평문으로 남습니다.
 
    ```
    KIS_APP_KEY=발급받은키
@@ -40,7 +44,18 @@ python -m server.main           # http://127.0.0.1:8000
    ```
 3. 서버를 다시 실행합니다. 상단 배지가 `MOCK 데이터`에서 `KIS 모의 · J`로 바뀌면 연결된 것입니다.
 
-`.env`와 `data/` 폴더(토큰 캐시, 분봉 캐시, 그린 선)는 `.gitignore`에 들어 있어서 git에 올라가지 않습니다.
+`.env`와 `data/` 폴더(암호화한 키·토큰, 분봉 캐시, 그린 선)는 `.gitignore`에 들어 있어서 git에 올라가지 않습니다.
+
+## 키와 토큰 보관
+
+- App Key·App Secret(`data/kis_credentials.bin`), 접근토큰(`data/kis_token_*.bin`), 웹소켓 접속키(`data/kis_approval_*.bin`)는 Windows DPAPI로 **현재 Windows 사용자 계정**에 묶어 암호화합니다. 파일을 다른 계정이나 다른 PC로 복사하면 풀리지 않으므로, 옮긴 뒤에는 키를 다시 연결해야 합니다.
+- 예전 버전이 `.env`에 평문으로 저장한 키는 데스크톱 앱을 처음 켤 때 암호화 저장소로 옮기고 `.env`에서는 값을 지웁니다. 평문 토큰 캐시(`data/kis_token_*.json`, `data/kis_approval_*.json`)는 서버를 켤 때 지웁니다.
+- Windows가 아닌 운영체제에서는 토큰을 디스크에 남기지 않고 메모리에만 둡니다. 그래서 서버를 다시 켜면 토큰을 새로 발급받습니다.
+
+## 실시간 연결 보안
+
+- **KIS ↔ 앱:** KIS 실시간 서버(`ops.koreainvestment.com:21000/31000`)는 `wss://`(TLS)를 지원하지 않습니다(두 포트 모두 TLS 핸드셰이크에 응답하지 않음을 확인했습니다). 그래서 이 구간의 시세와 웹소켓 접속키는 암호화되지 않습니다. 접속키는 실시간 시세 구독에만 쓰이고 주문이나 REST 조회에는 쓸 수 없습니다. 앱은 받은 메시지를 그대로 믿지 않고 TR·종목·가격·시각·건수·크기를 검사해 맞지 않는 틱은 버립니다. 재접속할 때는 대기 시간을 무작위로 흩뜨리고, 접속키 강제 재발급은 1분에 한 번으로 제한합니다. REST(토큰·차트)는 HTTPS 인증서를 검증하고 리다이렉트를 따라가지 않습니다.
+- **앱 내부(창 ↔ 로컬 서버):** 로컬 서버는 다른 웹사이트가 보낸 요청(Origin·Sec-Fetch-Site 검사)과 DNS 리바인딩(Host 검사)을 거부합니다. 데스크톱 앱은 실행할 때마다 새 일회용 토큰으로 앱 창에만 세션 쿠키(HttpOnly, SameSite=Strict)를 주므로, 같은 PC의 다른 사용자나 프로그램은 실시간 웹소켓과 API에 붙을 수 없습니다.
 
 ## 사용법
 
@@ -82,7 +97,9 @@ server/
   mock_source.py   키 없이 확인하기 위한 가짜 시세 (24시간 생성)
   bars.py          KST 시간 처리, 타임프레임 집계
   hub.py           실시간 틱을 여러 브라우저 연결에 나눠 주는 허브
-  config.py        .env 설정
+  config.py        .env 설정, 암호화 저장소의 연결 정보
+  vault.py         Windows DPAPI 암호화 저장 (키·토큰)
+  guard.py         로컬 서버 접근 제한 (Host·Origin 검사, 데스크톱 세션 쿠키)
 web/
   index.html, css/style.css
   js/app.js        차트, 데이터 로드, 실시간 갱신, 툴바
@@ -100,7 +117,7 @@ web/
 | 과거 분봉 (최대 1년) | FHKST03010230 `inquire-time-dailychartprice` | 120건 |
 | 실시간 체결 | H0STCNT0 / H0UNCNT0 / H0NXCNT0 (WebSocket) | 세션당 약 40종목 |
 
-- 접근토큰은 하루 동안 유효하고 1분에 1회만 발급되므로 `data/kis_token_*.json`에 캐시합니다.
+- 접근토큰은 하루 동안 유효하고 1분에 1회만 발급되므로 `data/kis_token_*.bin`에 암호화해 캐시합니다.
 - 초당 호출 제한(실전 20건, 모의 5건)을 넘지 않도록 서버가 호출 간격을 조절합니다.
 - 지난 날짜의 분봉은 `data/cache/`에 저장해 두므로, 같은 종목은 두 번째부터 빠르게 열립니다.
 - 3·5·15·30·60분봉은 1분봉을 서버에서 묶어서 만듭니다. 분봉의 기본 조회 기간은 `server/main.py`의 `DEFAULT_DAYS`에서 바꿀 수 있습니다.
